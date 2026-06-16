@@ -1,6 +1,7 @@
 export type ViewKey = "translate" | "wordbook" | "daily" | "settings";
 
 export type Level = "zero" | "beginner" | "skilled" | "advanced";
+export type ProviderType = "mymemory" | "libretranslate" | "openai";
 
 export interface Definition {
   partOfSpeech: string;
@@ -30,6 +31,7 @@ export interface WordbookEntry {
   translation: string;
   definitions: Definition[];
   examples: string[];
+  level: Level;
   source: string;
   createdAt: string;
 }
@@ -40,7 +42,18 @@ export interface DailyItem {
   language: string;
   translation: string;
   examples: string[];
+  exampleTranslations: string[];
   level: Level;
+}
+
+export interface ApiProvider {
+  id: string;
+  name: string;
+  providerType: ProviderType;
+  enabled: boolean;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
 }
 
 export interface AppSettings {
@@ -50,6 +63,9 @@ export interface AppSettings {
   dailyLevel: Level;
   shortcutTranslate: string;
   shortcutScreenshot: string;
+  closeToTray: boolean;
+  activeProviderId: string;
+  apiProviders: ApiProvider[];
   libreTranslateUrl: string;
   openAiBaseUrl: string;
   openAiApiKey: string;

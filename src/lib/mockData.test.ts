@@ -13,4 +13,10 @@ describe("daily fallback", () => {
     expect(items).toHaveLength(5);
     expect(items[0].language).toBe("fr");
   });
+
+  it("changes non-English vocabulary by level", () => {
+    const beginner = dailyFallback("ja", "beginner").map((item) => item.word);
+    const advanced = dailyFallback("ja", "advanced").map((item) => item.word);
+    expect(beginner).not.toEqual(advanced);
+  });
 });

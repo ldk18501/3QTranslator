@@ -16,7 +16,10 @@
         "width": 1180,
         "height": 780,
         "minWidth": 880,
-        "minHeight": 620
+        "minHeight": 620,
+        "minimizable": true,
+        "maximizable": true,
+        "closable": true
       }
     ],
     "security": {

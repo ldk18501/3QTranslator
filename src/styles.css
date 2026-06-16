@@ -308,6 +308,26 @@ button:disabled {
   padding-left: 20px;
 }
 
+.daily-examples li {
+  line-height: 1.45;
+}
+
+.daily-examples span,
+.daily-examples em {
+  display: block;
+}
+
+.daily-examples em {
+  color: #69758c;
+  font-style: normal;
+  margin-top: 3px;
+}
+
+.inline-status {
+  color: #637087;
+  font-size: 14px;
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -373,6 +393,49 @@ button:disabled {
   box-shadow: none;
 }
 
+.wordbook-tools {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
+.filter-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.segmented-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.segment-button {
+  align-items: center;
+  background: #ffffff;
+  border: 1px solid #cbd7e7;
+  border-radius: 8px;
+  color: #435069;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 8px;
+  height: 34px;
+  padding: 0 12px;
+}
+
+.segment-button span {
+  color: #728095;
+  font-size: 12px;
+}
+
+.segment-button.active {
+  background: #eaf2ff;
+  border-color: #9bb8ff;
+  color: #224ec9;
+}
+
 .group-list,
 .word-group,
 .daily-grid {
@@ -422,8 +485,37 @@ button:disabled {
   margin: 0;
 }
 
+.word-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.word-card-meta span {
+  background: #f1f5fa;
+  border: 1px solid #d9e3ef;
+  border-radius: 999px;
+  color: #526078;
+  font-size: 12px;
+  padding: 4px 9px;
+}
+
 .word-card em {
   color: #6c778b;
+}
+
+.danger-button {
+  align-items: center;
+  background: #fff4f2;
+  border: 1px solid #f2c7c1;
+  border-radius: 8px;
+  color: #b42318;
+  cursor: pointer;
+  display: inline-flex;
+  gap: 8px;
+  height: 34px;
+  justify-content: center;
+  padding: 0 12px;
 }
 
 .settings-grid label {
@@ -431,6 +523,36 @@ button:disabled {
   display: grid;
   font-size: 14px;
   gap: 8px;
+}
+
+.toggle-field {
+  align-items: center;
+  border: 1px solid #dce5ef;
+  display: flex !important;
+  justify-content: space-between;
+  padding: 14px 16px;
+}
+
+.toggle-field span {
+  display: grid;
+  gap: 4px;
+}
+
+.toggle-field strong {
+  color: #1f2a44;
+  font-size: 15px;
+}
+
+.toggle-field em {
+  color: #66738a;
+  font-size: 13px;
+  font-style: normal;
+  line-height: 1.45;
+}
+
+.toggle-field input {
+  height: 22px;
+  width: 42px;
 }
 
 .wide-field {
@@ -443,6 +565,77 @@ button:disabled {
   display: flex;
   gap: 10px;
   padding: 14px 16px;
+}
+
+.api-section {
+  display: grid;
+  gap: 14px;
+}
+
+.section-title-row {
+  align-items: center;
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+}
+
+.section-title-row h2 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.section-title-row p {
+  color: #657189;
+  margin: 5px 0 0;
+}
+
+.provider-list {
+  display: grid;
+  gap: 12px;
+}
+
+.provider-card {
+  background: #ffffff;
+  border: 1px solid #dbe4ef;
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+}
+
+.provider-card-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.provider-fields {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.provider-fields label {
+  color: #47536a;
+  display: grid;
+  font-size: 14px;
+  gap: 8px;
+}
+
+.toggle-inline {
+  align-items: center;
+  color: #33415c;
+  display: inline-flex;
+  gap: 8px;
+}
+
+.toggle-inline input {
+  height: 18px;
+  width: 18px;
+}
+
+.danger-icon {
+  color: #b42318;
 }
 
 @media (max-width: 880px) {
