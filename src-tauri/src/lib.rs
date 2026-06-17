@@ -69,6 +69,12 @@ struct DailyItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AiDailyPayload {
+    items: Vec<DailyItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ApiProvider {
     id: String,
     name: String,
@@ -86,6 +92,8 @@ struct AppSettings {
     default_other_target: String,
     daily_language: String,
     daily_level: String,
+    #[serde(default = "default_daily_cache_limit")]
+    daily_cache_limit: i64,
     shortcut_translate: String,
     shortcut_screenshot: String,
     #[serde(default = "default_close_to_tray")]
@@ -108,6 +116,10 @@ fn default_close_to_tray() -> bool {
 
 fn default_active_provider_id() -> String {
     "mymemory".into()
+}
+
+fn default_daily_cache_limit() -> i64 {
+    120
 }
 
 fn default_api_providers() -> Vec<ApiProvider> {
@@ -148,6 +160,7 @@ fn default_settings() -> AppSettings {
         default_other_target: "en".into(),
         daily_language: "en".into(),
         daily_level: "beginner".into(),
+        daily_cache_limit: default_daily_cache_limit(),
         shortcut_translate: "Ctrl+Alt+Q".into(),
         shortcut_screenshot: "Ctrl+Alt+S".into(),
         close_to_tray: default_close_to_tray(),
@@ -512,6 +525,192 @@ async fn translate_with_configured_provider(
     (fallback, provider_name)
 }
 
+fn language_name(language: &str) -> &'static str {
+    match language {
+        "zh" => "中文",
+        "en" => "英语",
+        "ja" => "日语",
+        "ko" => "韩语",
+        "fr" => "法语",
+        "de" => "德语",
+        "es" => "西班牙语",
+        "ru" => "俄语",
+        "it" => "意大利语",
+        "pt" => "葡萄牙语",
+        "ar" => "阿拉伯语",
+        _ => "目标语言",
+    }
+}
+
+fn level_name(level: &str) -> &'static str {
+    match level {
+        "zero" => "完全不会",
+        "skilled" => "熟练",
+        "advanced" => "精通",
+        _ => "入门",
+    }
+}
+
+fn active_openai_provider(settings: &AppSettings) -> Option<ApiProvider> {
+    settings
+        .api_providers
+        .iter()
+        .find(|provider| {
+            provider.enabled
+                && provider.provider_type == "openai"
+                && provider.id == settings.active_provider_id
+                && !provider.base_url.trim().is_empty()
+                && !provider.api_key.trim().is_empty()
+        })
+        .or_else(|| {
+            settings.api_providers.iter().find(|provider| {
+                provider.enabled
+                    && provider.provider_type == "openai"
+                    && !provider.base_url.trim().is_empty()
+                    && !provider.api_key.trim().is_empty()
+            })
+        })
+        .cloned()
+}
+
+fn strip_json_markdown(content: &str) -> &str {
+    let trimmed = content.trim();
+    if let Some(rest) = trimmed.strip_prefix("```json") {
+        return rest.trim().trim_end_matches("```").trim();
+    }
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        return rest.trim().trim_end_matches("```").trim();
+    }
+    trimmed
+}
+
+fn validate_ai_daily_items(
+    mut payload: AiDailyPayload,
+    language: &str,
+    level: &str,
+    date: &str,
+) -> Option<Vec<DailyItem>> {
+    if payload.items.len() != 5 {
+        return None;
+    }
+    for (index, item) in payload.items.iter_mut().enumerate() {
+        if item.word.trim().is_empty()
+            || item.translation.trim().is_empty()
+            || item.examples.len() != 3
+            || item.example_translations.len() != 3
+            || item
+                .examples
+                .iter()
+                .any(|example| example.trim().is_empty())
+            || item
+                .example_translations
+                .iter()
+                .any(|translation| translation.trim().is_empty())
+        {
+            return None;
+        }
+        item.id = format!("{}-{}-ai-{}-{}", language, level, date, index);
+        item.language = language.into();
+        item.level = level.into();
+    }
+    Some(payload.items)
+}
+
+async fn generate_daily_items_with_openai(
+    language: &str,
+    level: &str,
+    date: &str,
+    force_refresh: bool,
+    settings: &AppSettings,
+) -> Option<Vec<DailyItem>> {
+    let provider = active_openai_provider(settings)?;
+    let base_url = provider.base_url.trim().trim_end_matches('/');
+    let endpoint = if base_url.ends_with("/chat/completions") {
+        base_url.to_string()
+    } else {
+        format!("{}/chat/completions", base_url)
+    };
+    let model = if provider.model.trim().is_empty() {
+        "gpt-4o-mini"
+    } else {
+        provider.model.trim()
+    };
+    let translation_language = if language == "zh" { "英语" } else { "中文" };
+    let refresh_instruction = if force_refresh {
+        "这是用户手动刷新，请避开常规首选词，换一组同难度的新词。"
+    } else {
+        "这是当天首次生成，请选择适合长期学习的常用词。"
+    };
+    let prompt = format!(
+        r#"为一款外语学习软件生成“每日学习”内容。
+学习语言：{language_name}
+学习难度：{level_name}
+日期：{date}
+翻译语言：{translation_language}
+额外要求：{refresh_instruction}
+
+请返回 5 组真实、自然、适合该难度的学习词汇。每组必须包含：
+1. word：{language_name}中的真实常用词或常用短语，不要生僻词、乱码、词典标题、专有名词。
+2. translation：用{translation_language}给出准确释义。
+3. examples：3 条自然例句，必须使用 {language_name}，并且每句都要真实表达该词的常见用法。
+4. exampleTranslations：3 条与 examples 一一对应的{translation_language}翻译。
+5. level：必须是 "{level}"。
+
+难度标准：
+- 完全不会：问候、数字、家庭、食物、日常名词和最基础动词。
+- 入门：高频日常表达、基础动词、常见形容词。
+- 熟练：抽象但常用的学习、工作、交流词汇。
+- 精通：语域、隐含意义、抽象表达、地道表达，但仍必须常用。
+
+只返回 JSON，不要 Markdown，不要解释。格式必须完全如下：
+{{"items":[{{"word":"...","translation":"...","examples":["...","...","..."],"exampleTranslations":["...","...","..."],"level":"{level}"}}]}}"#,
+        language_name = language_name(language),
+        level_name = level_name(level),
+        date = date,
+        translation_language = translation_language,
+        refresh_instruction = refresh_instruction,
+        level = level
+    );
+
+    for attempt in 0..2 {
+        let body = json!({
+            "model": model,
+            "temperature": if force_refresh { 0.75 } else { 0.45 },
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是严谨的外语老师和结构化 JSON 生成器。你必须只输出合法 JSON。"
+                },
+                {
+                    "role": "user",
+                    "content": if attempt == 0 {
+                        prompt.clone()
+                    } else {
+                        format!("{}\n\n上一次输出未通过校验。请严格返回 5 项，每项 3 条例句和 3 条对应翻译，只输出合法 JSON。", prompt)
+                    }
+                }
+            ]
+        });
+        let response = reqwest::Client::new()
+            .post(&endpoint)
+            .bearer_auth(provider.api_key.trim())
+            .json(&body)
+            .send()
+            .await
+            .ok()?;
+        let data = response.json::<Value>().await.ok()?;
+        let content = data
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)?;
+        if let Ok(payload) = serde_json::from_str::<AiDailyPayload>(strip_json_markdown(content)) {
+            if let Some(items) = validate_ai_daily_items(payload, language, level, date) {
+                return Some(items);
+            }
+        }
+    }
+    None
+}
+
 async fn english_dictionary(
     text: &str,
 ) -> (Option<String>, Vec<Definition>, Vec<String>, Vec<String>) {
@@ -771,7 +970,35 @@ fn delete_wordbook_entry(state: State<'_, AppState>, id: String) -> Result<(), S
 }
 
 fn language_level_words(language: &str, level: &str) -> Option<Vec<(&'static str, &'static str)>> {
-    let words = match (language, level) {
+    let mut words = match (language, level) {
+        ("en", "zero") => vec![
+            ("hello", "你好"),
+            ("book", "书"),
+            ("water", "水"),
+            ("friend", "朋友"),
+            ("home", "家"),
+        ],
+        ("en", "beginner") => vec![
+            ("practice", "练习"),
+            ("curious", "好奇的"),
+            ("useful", "有用的"),
+            ("improve", "提高"),
+            ("sentence", "句子"),
+        ],
+        ("en", "skilled") => vec![
+            ("nuance", "细微差别"),
+            ("fluent", "流利的"),
+            ("context", "语境"),
+            ("retain", "记住；保留"),
+            ("phrase", "短语"),
+        ],
+        ("en", "advanced") => vec![
+            ("idiomatic", "地道的；惯用的"),
+            ("ambiguity", "歧义"),
+            ("register", "语域"),
+            ("connotation", "隐含意义"),
+            ("paraphrase", "改述"),
+        ],
         ("zh", "zero") => vec![
             ("你好", "hello"),
             ("谢谢", "thank you"),
@@ -942,7 +1169,266 @@ fn language_level_words(language: &str, level: &str) -> Option<Vec<(&'static str
         ],
         _ => return None,
     };
+    words.extend(language_level_extensions(language, level));
     Some(words)
+}
+
+fn language_level_extensions(language: &str, level: &str) -> Vec<(&'static str, &'static str)> {
+    match (language, level) {
+        ("en", "zero") => vec![
+            ("food", "食物"),
+            ("day", "一天；白天"),
+            ("name", "名字"),
+            ("good", "好的"),
+            ("help", "帮助"),
+            ("school", "学校"),
+            ("family", "家庭"),
+        ],
+        ("en", "beginner") => vec![
+            ("listen", "听"),
+            ("remember", "记住"),
+            ("question", "问题"),
+            ("answer", "回答"),
+            ("travel", "旅行"),
+            ("morning", "早晨"),
+            ("because", "因为"),
+        ],
+        ("en", "skilled") => vec![
+            ("summarize", "总结"),
+            ("accurate", "准确的"),
+            ("contrast", "对比"),
+            ("assume", "假设"),
+            ("evidence", "证据"),
+            ("specific", "具体的"),
+            ("transfer", "迁移；转移"),
+        ],
+        ("en", "advanced") => vec![
+            ("subtle", "微妙的"),
+            ("coherence", "连贯性"),
+            ("inference", "推断"),
+            ("rhetoric", "修辞"),
+            ("approximate", "近似的"),
+            ("constraint", "约束"),
+            ("interpretation", "解释；理解"),
+        ],
+        ("zh", "zero") => vec![
+            ("饭", "meal"),
+            ("人", "person"),
+            ("名字", "name"),
+            ("好", "good"),
+            ("学校", "school"),
+            ("朋友", "friend"),
+            ("今天", "today"),
+        ],
+        ("zh", "beginner") => vec![
+            ("问题", "question"),
+            ("回答", "answer"),
+            ("早上", "morning"),
+            ("旅行", "travel"),
+            ("需要", "need"),
+            ("帮助", "help"),
+            ("句子", "sentence"),
+        ],
+        ("zh", "skilled") => vec![
+            ("准确", "accurate"),
+            ("比较", "compare"),
+            ("总结", "summarize"),
+            ("证据", "evidence"),
+            ("具体", "specific"),
+            ("假设", "assumption"),
+            ("短语", "phrase"),
+        ],
+        ("zh", "advanced") => vec![
+            ("连贯性", "coherence"),
+            ("推断", "inference"),
+            ("修辞", "rhetoric"),
+            ("约束", "constraint"),
+            ("诠释", "interpretation"),
+            ("近似", "approximation"),
+            ("细微差别", "nuance"),
+        ],
+        ("ja", "zero") => vec![
+            ("人", "人"),
+            ("名前", "名字"),
+            ("学校", "学校"),
+            ("友達", "朋友"),
+            ("今日", "今天"),
+            ("良い", "好的"),
+            ("食べ物", "食物"),
+        ],
+        ("ja", "beginner") => vec![
+            ("質問", "问题"),
+            ("答え", "回答"),
+            ("旅行", "旅行"),
+            ("必要", "需要"),
+            ("助ける", "帮助"),
+            ("文", "句子"),
+            ("覚える", "记住"),
+        ],
+        ("ja", "skilled") => vec![
+            ("正確", "准确"),
+            ("比較", "比较"),
+            ("要約", "总结"),
+            ("証拠", "证据"),
+            ("具体的", "具体的"),
+            ("仮定", "假设"),
+            ("変換", "转化"),
+        ],
+        ("ja", "advanced") => vec![
+            ("一貫性", "连贯性"),
+            ("推論", "推断"),
+            ("修辞", "修辞"),
+            ("制約", "约束"),
+            ("解釈", "解释"),
+            ("近似", "近似"),
+            ("微妙", "微妙的"),
+        ],
+        ("ko", "zero") => vec![
+            ("사람", "人"),
+            ("이름", "名字"),
+            ("학교", "学校"),
+            ("친구", "朋友"),
+            ("오늘", "今天"),
+            ("좋다", "好的"),
+            ("음식", "食物"),
+        ],
+        ("ko", "beginner") => vec![
+            ("질문", "问题"),
+            ("대답", "回答"),
+            ("여행", "旅行"),
+            ("도움", "帮助"),
+            ("문장", "句子"),
+            ("기억하다", "记住"),
+            ("좋아하다", "喜欢"),
+        ],
+        ("ko", "skilled") => vec![
+            ("정확한", "准确的"),
+            ("비교", "比较"),
+            ("요약", "总结"),
+            ("증거", "证据"),
+            ("구체적", "具体的"),
+            ("가정", "假设"),
+            ("전환", "转化"),
+        ],
+        ("ko", "advanced") => vec![
+            ("일관성", "连贯性"),
+            ("추론", "推断"),
+            ("수사", "修辞"),
+            ("제약", "约束"),
+            ("해석", "解释"),
+            ("근사", "近似"),
+            ("미묘함", "微妙"),
+        ],
+        ("fr", "zero") => vec![
+            ("personne", "人"),
+            ("nom", "名字"),
+            ("école", "学校"),
+            ("bon", "好的"),
+            ("nourriture", "食物"),
+            ("jour", "一天"),
+            ("famille", "家庭"),
+        ],
+        ("fr", "beginner") => vec![
+            ("question", "问题"),
+            ("réponse", "回答"),
+            ("pratiquer", "练习"),
+            ("voyager", "旅行"),
+            ("besoin", "需要"),
+            ("aider", "帮助"),
+            ("phrase", "句子"),
+        ],
+        ("fr", "skilled") => vec![
+            ("précis", "准确的"),
+            ("comparer", "比较"),
+            ("résumer", "总结"),
+            ("preuve", "证据"),
+            ("spécifique", "具体的"),
+            ("hypothèse", "假设"),
+            ("formulation", "措辞"),
+        ],
+        ("fr", "advanced") => vec![
+            ("cohérence", "连贯性"),
+            ("inférence", "推断"),
+            ("rhétorique", "修辞"),
+            ("contrainte", "约束"),
+            ("interprétation", "解释"),
+            ("approximation", "近似"),
+            ("idiomatique", "地道的"),
+        ],
+        ("de", "zero") => vec![
+            ("Mensch", "人"),
+            ("Name", "名字"),
+            ("Schule", "学校"),
+            ("gut", "好的"),
+            ("Essen", "食物"),
+            ("Tag", "一天"),
+            ("Familie", "家庭"),
+        ],
+        ("de", "beginner") => vec![
+            ("Frage", "问题"),
+            ("Antwort", "回答"),
+            ("üben", "练习"),
+            ("reisen", "旅行"),
+            ("brauchen", "需要"),
+            ("helfen", "帮助"),
+            ("Satz", "句子"),
+        ],
+        ("de", "skilled") => vec![
+            ("genau", "准确的"),
+            ("vergleichen", "比较"),
+            ("zusammenfassen", "总结"),
+            ("Beweis", "证据"),
+            ("spezifisch", "具体的"),
+            ("Annahme", "假设"),
+            ("Wendung", "短语"),
+        ],
+        ("de", "advanced") => vec![
+            ("Kohärenz", "连贯性"),
+            ("Schlussfolgerung", "推断"),
+            ("Rhetorik", "修辞"),
+            ("Einschränkung", "约束"),
+            ("Interpretation", "解释"),
+            ("Annäherung", "近似"),
+            ("idiomatisch", "地道的"),
+        ],
+        ("es", "zero") => vec![
+            ("persona", "人"),
+            ("nombre", "名字"),
+            ("escuela", "学校"),
+            ("bueno", "好的"),
+            ("comida", "食物"),
+            ("día", "一天"),
+            ("familia", "家庭"),
+        ],
+        ("es", "beginner") => vec![
+            ("pregunta", "问题"),
+            ("respuesta", "回答"),
+            ("practicar", "练习"),
+            ("viajar", "旅行"),
+            ("necesitar", "需要"),
+            ("ayudar", "帮助"),
+            ("frase", "句子"),
+        ],
+        ("es", "skilled") => vec![
+            ("preciso", "准确的"),
+            ("comparar", "比较"),
+            ("resumir", "总结"),
+            ("evidencia", "证据"),
+            ("específico", "具体的"),
+            ("suposición", "假设"),
+            ("matiz", "细微差别"),
+        ],
+        ("es", "advanced") => vec![
+            ("coherencia", "连贯性"),
+            ("inferencia", "推断"),
+            ("retórica", "修辞"),
+            ("restricción", "约束"),
+            ("interpretación", "解释"),
+            ("aproximación", "近似"),
+            ("idiomático", "地道的"),
+        ],
+        _ => vec![],
+    }
 }
 
 fn examples_for_daily_word(language: &str, word: &str) -> (Vec<String>, Vec<String>) {
@@ -1020,6 +1506,23 @@ fn examples_for_daily_word(language: &str, word: &str) -> (Vec<String>, Vec<Stri
             ],
         ),
     }
+}
+
+fn daily_variant(language: &str, level: &str, date: &str, force_refresh: bool) -> usize {
+    let source = if force_refresh {
+        format!(
+            "{}:{}:{}:{}",
+            date,
+            language,
+            level,
+            Local::now().timestamp()
+        )
+    } else {
+        format!("{}:{}:{}", date, language, level)
+    };
+    source.chars().fold(0usize, |sum, ch| {
+        sum.wrapping_mul(31).wrapping_add(ch as usize)
+    })
 }
 
 fn daily_fallback(language: &str, level: &str, variant: usize) -> Vec<DailyItem> {
@@ -1719,17 +2222,16 @@ fn daily_fallback(language: &str, level: &str, variant: usize) -> Vec<DailyItem>
 }
 
 #[tauri::command]
-fn get_daily_items(
+async fn get_daily_items(
     state: State<'_, AppState>,
     language: String,
     level: String,
     force_refresh: bool,
 ) -> Result<Vec<DailyItem>, String> {
     let today = Local::now().date_naive().to_string();
-    let cache_key = format!("v3:{}:{}", language, level);
-    let conn = state.db.lock().map_err(|err| err.to_string())?;
-
+    let cache_key = format!("v5:{}:{}", language, level);
     if !force_refresh {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
         let mut stmt = conn
             .prepare("select date, items_json from daily_cache where cache_key = ?1")
             .map_err(|err| err.to_string())?;
@@ -1745,23 +2247,43 @@ fn get_daily_items(
         }
     }
 
-    let variant = if force_refresh {
-        Local::now().timestamp() as usize
-    } else {
-        0
+    let settings = {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
+        load_settings_from_db(&conn)?
     };
-    let items = daily_fallback(&language, &level, variant);
-    conn.execute(
-        "insert or replace into daily_cache(cache_key, date, items_json) values (?1, ?2, ?3)",
-        params![
-            cache_key,
-            today,
-            serde_json::to_string(&items).map_err(|err| err.to_string())?
-        ],
-    )
-    .map_err(|err| err.to_string())?;
+    let variant = daily_variant(&language, &level, &today, force_refresh);
+    let items =
+        generate_daily_items_with_openai(&language, &level, &today, force_refresh, &settings)
+            .await
+            .unwrap_or_else(|| daily_fallback(&language, &level, variant));
+    {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
+        conn.execute(
+            "insert or replace into daily_cache(cache_key, date, items_json) values (?1, ?2, ?3)",
+            params![
+                cache_key,
+                today,
+                serde_json::to_string(&items).map_err(|err| err.to_string())?
+            ],
+        )
+        .map_err(|err| err.to_string())?;
+        trim_daily_cache(&conn, settings.daily_cache_limit)?;
+    }
 
     Ok(items)
+}
+
+fn trim_daily_cache(conn: &Connection, limit: i64) -> Result<(), String> {
+    let limit = limit.clamp(20, 1000);
+    conn.execute(
+        "delete from daily_cache
+         where rowid not in (
+             select rowid from daily_cache order by date desc, rowid desc limit ?1
+         )",
+        params![limit],
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]

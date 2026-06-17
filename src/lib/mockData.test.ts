@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { dailyFallback } from "./mockData";
+import { dailyFallback } from "./dailyWordBank";
 
 describe("daily fallback", () => {
   it("returns five learning items with three examples", () => {

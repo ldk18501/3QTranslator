@@ -61,6 +61,7 @@ export interface AppSettings {
   defaultOtherTarget: string;
   dailyLanguage: string;
   dailyLevel: Level;
+  dailyCacheLimit: number;
   shortcutTranslate: string;
   shortcutScreenshot: string;
   closeToTray: boolean;

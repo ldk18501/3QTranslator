@@ -391,6 +391,21 @@ function DailyView({ settings }: { settings?: AppSettings }) {
     queryFn: () => getDailyItems(language, level, forceRefresh > 0),
   });
 
+  const settingsMutation = useMutation({
+    mutationFn: (value: AppSettings) => saveSettings(value),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["settings"] }),
+  });
+
+  const changeLanguage = (value: string) => {
+    setLanguage(value);
+    if (settings) settingsMutation.mutate({ ...settings, dailyLanguage: value, dailyLevel: level });
+  };
+
+  const changeLevel = (value: AppSettings["dailyLevel"]) => {
+    setLevel(value);
+    if (settings) settingsMutation.mutate({ ...settings, dailyLanguage: language, dailyLevel: value });
+  };
+
   const addMutation = useMutation({
     mutationFn: (item: DailyItem) => addToWordbook(item),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["wordbook"] }),
@@ -404,10 +419,10 @@ function DailyView({ settings }: { settings?: AppSettings }) {
           <p>每天 5 组单词与例句，适合打开软件后先热身。</p>
         </div>
         <div className="header-actions">
-          <select value={language} onChange={(event) => setLanguage(event.target.value)}>
+          <select value={language} onChange={(event) => changeLanguage(event.target.value)}>
             {languageOptions.map((item) => <option key={item.code} value={item.code}>{item.label}</option>)}
           </select>
-          <select value={level} onChange={(event) => setLevel(event.target.value as AppSettings["dailyLevel"])}>
+          <select value={level} onChange={(event) => changeLevel(event.target.value as AppSettings["dailyLevel"])}>
             {levelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
           </select>
           <button className="icon-button" onClick={() => setForceRefresh((value) => value + 1)} title="刷新">
@@ -416,7 +431,7 @@ function DailyView({ settings }: { settings?: AppSettings }) {
         </div>
       </header>
 
-      {dailyQuery.isFetching && <div className="inline-status">正在准备学习内容...</div>}
+      {dailyQuery.isFetching && <div className="inline-status">正在生成今日学习内容，首次生成会稍慢...</div>}
 
       <div className="daily-grid">
         {(dailyQuery.data ?? []).map((item) => (
@@ -516,6 +531,16 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
           <select value={draft.defaultOtherTarget} onChange={(event) => set("defaultOtherTarget", event.target.value)}>
             {languageOptions.map((item) => <option key={item.code} value={item.code}>{item.label}</option>)}
           </select>
+        </label>
+        <label>
+          每日学习缓存上限
+          <input
+            type="number"
+            min={20}
+            max={1000}
+            value={draft.dailyCacheLimit}
+            onChange={(event) => set("dailyCacheLimit", Number(event.target.value) || 120)}
+          />
         </label>
         <label>
           呼出翻译窗口

@@ -1,5 +1,6 @@
 import type { ApiProvider, AppSettings, DailyItem, Level, TranslationResult, WordbookEntry } from "./types";
-import { dailyFallback, fallbackDefinitions } from "./mockData";
+import { fallbackDefinitions } from "./mockData";
+import { dailyFallback } from "./dailyWordBank";
 import { defaultTargetFor, detectLanguage, looksLikeWord } from "./language";
 
 const isTauri = "__TAURI_INTERNALS__" in window;
@@ -14,6 +15,7 @@ const defaultSettings: AppSettings = {
   defaultOtherTarget: "en",
   dailyLanguage: "en",
   dailyLevel: "beginner",
+  dailyCacheLimit: 120,
   shortcutTranslate: "Ctrl+Alt+Q",
   shortcutScreenshot: "Ctrl+Alt+S",
   closeToTray: true,
@@ -242,7 +244,7 @@ export async function getDailyItems(language: string, level: AppSettings["dailyL
   }
 
   const today = new Date().toISOString().slice(0, 10);
-  const key = `daily:v2:${language}:${level}`;
+  const key = `daily:v5:${language}:${level}`;
   const cached = readLocal<{ date: string; items: DailyItem[] } | null>(key, null);
   if (!forceRefresh && cached?.date === today) return cached.items;
   const items = dailyFallback(language, level, forceRefresh);
