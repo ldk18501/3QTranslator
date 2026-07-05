@@ -3,13 +3,15 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
+use std::io::Cursor;
 use std::sync::Mutex;
 use tauri::{
+    AppHandle,
     menu::MenuBuilder,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, Manager, State, WindowEvent,
 };
-use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 struct AppState {
     db: Mutex<Connection>,
@@ -83,6 +85,14 @@ struct ApiProvider {
     base_url: String,
     api_key: String,
     model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderTestResult {
+    ok: bool,
+    message: String,
+    translated_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +238,7 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 }
 
 fn detect_language(text: &str) -> String {
+    let lower = text.trim().to_lowercase();
     if text
         .chars()
         .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
@@ -253,9 +264,37 @@ fn detect_language(text: &str) -> String {
         .any(|ch| ('\u{0600}'..='\u{06ff}').contains(&ch))
     {
         "ar".into()
+    } else if lower.chars().any(|ch| "àâæçèêëîïôœùûÿ".contains(ch))
+        || contains_any_word(
+            &lower,
+            &["le", "la", "les", "des", "une", "bonjour", "merci", "avec", "pour", "dans"],
+        )
+    {
+        "fr".into()
+    } else if lower.chars().any(|ch| "ñ¿¡".contains(ch))
+        || contains_any_word(
+            &lower,
+            &["el", "la", "los", "las", "una", "gracias", "hola", "por", "para", "que", "con"],
+        )
+    {
+        "es".into()
+    } else if lower.chars().any(|ch| "äöüß".contains(ch))
+        || contains_any_word(
+            &lower,
+            &["der", "die", "das", "und", "ich", "nicht", "mit", "fur", "für", "ist", "danke", "hallo"],
+        )
+    {
+        "de".into()
+    } else if lower.chars().any(|ch| "ãõçáâêíóôú".contains(ch)) {
+        "pt".into()
     } else {
         "en".into()
     }
+}
+
+fn contains_any_word(text: &str, words: &[&str]) -> bool {
+    text.split(|ch: char| !ch.is_alphabetic())
+        .any(|part| words.contains(&part))
 }
 
 fn looks_like_word(text: &str) -> bool {
@@ -380,6 +419,51 @@ fn should_close_to_tray(window: &tauri::Window) -> bool {
         })
         .map(|settings| settings.close_to_tray)
         .unwrap_or(default_close_to_tray())
+}
+
+fn validate_shortcut(label: &str, shortcut: &str) -> Result<String, String> {
+    let trimmed = shortcut.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{}快捷键不能为空", label));
+    }
+    if !trimmed.contains('+') {
+        return Err(format!("{}快捷键需要包含修饰键，例如 Ctrl+Alt+Q", label));
+    }
+    Ok(trimmed.to_lowercase())
+}
+
+fn register_configured_shortcuts(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
+    let translate_shortcut = validate_shortcut("呼出翻译窗口", &settings.shortcut_translate)?;
+    let screenshot_shortcut = validate_shortcut("截图翻译", &settings.shortcut_screenshot)?;
+    if translate_shortcut == screenshot_shortcut {
+        return Err("两个快捷键不能相同".into());
+    }
+
+    app.global_shortcut()
+        .unregister_all()
+        .map_err(|err| format!("清理旧快捷键失败：{}", err))?;
+
+    app.global_shortcut()
+        .on_shortcut(translate_shortcut.as_str(), |app, _shortcut, event| {
+            if event.state != ShortcutState::Pressed {
+                return;
+            }
+            show_main_window(app);
+            let _ = app.emit("3q-open-translate", ());
+        })
+        .map_err(|err| format!("注册呼出翻译窗口快捷键失败：{}", err))?;
+
+    app.global_shortcut()
+        .on_shortcut(screenshot_shortcut.as_str(), |app, _shortcut, event| {
+            if event.state != ShortcutState::Pressed {
+                return;
+            }
+            show_main_window(app);
+            let _ = app.emit("3q-screenshot-translate", ());
+        })
+        .map_err(|err| format!("注册截图翻译快捷键失败：{}", err))?;
+
+    Ok(())
 }
 
 async fn translate_with_mymemory(text: &str, source: &str, target: &str) -> Option<String> {
@@ -908,6 +992,11 @@ fn add_to_wordbook(state: State<'_, AppState>, item: Value) -> Result<WordbookEn
 
     let conn = state.db.lock().map_err(|err| err.to_string())?;
     conn.execute(
+        "delete from wordbook where text = ?1 and language = ?2 and target_language = ?3",
+        params![entry.text, entry.language, entry.target_language],
+    )
+    .map_err(|err| err.to_string())?;
+    conn.execute(
         "insert or replace into wordbook
         (id, text, language, target_language, translation, definitions_json, examples_json, level, source, created_at)
         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -967,6 +1056,45 @@ fn delete_wordbook_entry(state: State<'_, AppState>, id: String) -> Result<(), S
     conn.execute("delete from wordbook where id = ?1", params![id])
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn update_wordbook_entry_level(
+    state: State<'_, AppState>,
+    id: String,
+    level: String,
+) -> Result<WordbookEntry, String> {
+    let conn = state.db.lock().map_err(|err| err.to_string())?;
+    conn.execute(
+        "update wordbook set level = ?1 where id = ?2",
+        params![level, id],
+    )
+    .map_err(|err| err.to_string())?;
+
+    let mut stmt = conn
+        .prepare(
+            "select id, text, language, target_language, translation, definitions_json, examples_json, level, source, created_at
+             from wordbook where id = ?1",
+        )
+        .map_err(|err| err.to_string())?;
+    let mut rows = stmt.query(params![id]).map_err(|err| err.to_string())?;
+    let Some(row) = rows.next().map_err(|err| err.to_string())? else {
+        return Err("单词不存在".into());
+    };
+    let definitions_json: String = row.get(5).map_err(|err| err.to_string())?;
+    let examples_json: String = row.get(6).map_err(|err| err.to_string())?;
+    Ok(WordbookEntry {
+        id: row.get(0).map_err(|err| err.to_string())?,
+        text: row.get(1).map_err(|err| err.to_string())?,
+        language: row.get(2).map_err(|err| err.to_string())?,
+        target_language: row.get(3).map_err(|err| err.to_string())?,
+        translation: row.get(4).map_err(|err| err.to_string())?,
+        definitions: serde_json::from_str(&definitions_json).unwrap_or_default(),
+        examples: serde_json::from_str(&examples_json).unwrap_or_default(),
+        level: row.get(7).map_err(|err| err.to_string())?,
+        source: row.get(8).map_err(|err| err.to_string())?,
+        created_at: row.get(9).map_err(|err| err.to_string())?,
+    })
 }
 
 fn language_level_words(language: &str, level: &str) -> Option<Vec<(&'static str, &'static str)>> {
@@ -2293,20 +2421,162 @@ fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-fn save_settings(state: State<'_, AppState>, settings: AppSettings) -> Result<AppSettings, String> {
+async fn test_api_provider(provider: ApiProvider) -> Result<ProviderTestResult, String> {
+    let translated = match provider.provider_type.as_str() {
+        "libretranslate" => translate_with_libre("hello", "en", "zh", &provider).await,
+        "openai" => translate_with_openai("hello", "en", "zh", &provider).await,
+        _ => translate_with_mymemory("hello", "en", "zh").await,
+    };
+    if let Some(translated) = translated.filter(|value| !value.trim().is_empty()) {
+        return Ok(ProviderTestResult {
+            ok: true,
+            message: format!("{} 返回正常", provider.name),
+            translated_text: Some(translated),
+        });
+    }
+    Ok(ProviderTestResult {
+        ok: false,
+        message: "连接测试失败，请检查 Base URL、API Key 或模型名称".into(),
+        translated_text: None,
+    })
+}
+
+#[tauri::command]
+fn save_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: AppSettings,
+) -> Result<AppSettings, String> {
+    let previous = {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
+        load_settings_from_db(&conn)?
+    };
     let settings = normalize_settings(settings);
+    if let Err(err) = register_configured_shortcuts(&app, &settings) {
+        let _ = register_configured_shortcuts(&app, &previous);
+        return Err(err);
+    }
+
     let conn = state.db.lock().map_err(|err| err.to_string())?;
-    conn.execute(
+    if let Err(err) = conn.execute(
         "insert or replace into settings(key, value) values ('app_settings', ?1)",
         params![serde_json::to_string(&settings).map_err(|err| err.to_string())?],
-    )
-    .map_err(|err| err.to_string())?;
+    ) {
+        let _ = register_configured_shortcuts(&app, &previous);
+        return Err(err.to_string());
+    }
     Ok(settings)
 }
 
 #[tauri::command]
-async fn capture_and_translate() -> Result<TranslationResult, String> {
-    Err("截图入口已接入；OCR 需要 Windows OCR 绑定在本机 Rust 环境安装后继续验证。".into())
+async fn capture_and_translate(state: State<'_, AppState>) -> Result<TranslationResult, String> {
+    let clean_text = ocr_primary_monitor_text().await?;
+    let settings = {
+        let conn = state.db.lock().map_err(|err| err.to_string())?;
+        load_settings_from_db(&conn)?
+    };
+    let source_language = detect_language(&clean_text);
+    let target = default_target_for(&source_language, &settings, None);
+    let is_word = looks_like_word(&clean_text);
+    let (translated_text, provider_name) =
+        translate_with_configured_provider(&clean_text, &source_language, &target, &settings).await;
+    let (phonetic, definitions, examples, phrases) = if is_word && source_language == "en" {
+        english_dictionary(&clean_text).await
+    } else {
+        (None, vec![], vec![], vec![])
+    };
+
+    Ok(TranslationResult {
+        source_text: clean_text,
+        source_language,
+        target_language: target,
+        translated_text,
+        phonetic,
+        definitions,
+        examples,
+        phrases,
+        provider: format!("{} + Windows OCR", provider_name),
+        is_word,
+    })
+}
+
+async fn ocr_primary_monitor_text() -> Result<String, String> {
+    let monitors = xcap::Monitor::all().map_err(|err| format!("无法读取显示器：{}", err))?;
+    let monitor = monitors
+        .iter()
+        .find(|monitor| monitor.is_primary())
+        .or_else(|| monitors.first())
+        .ok_or_else(|| "未找到可截图的显示器".to_string())?;
+    let image = monitor
+        .capture_image()
+        .map_err(|err| format!("截图失败：{}", err))?;
+
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|err| format!("截图编码失败：{}", err))?;
+
+    let text = recognize_png_bytes_with_windows_ocr(&png).await?;
+    let clean_text = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if clean_text.is_empty() {
+        return Err("截图中没有识别到文字".into());
+    }
+    Ok(clean_text)
+}
+
+async fn recognize_png_bytes_with_windows_ocr(png: &[u8]) -> Result<String, String> {
+    use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, SoftwareBitmap};
+    use windows::Media::Ocr::OcrEngine;
+    use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+
+    let stream = InMemoryRandomAccessStream::new().map_err(|err| format!("创建 OCR 输入流失败：{}", err))?;
+    let writer = DataWriter::CreateDataWriter(&stream).map_err(|err| format!("创建 OCR 写入器失败：{}", err))?;
+    writer
+        .WriteBytes(png)
+        .map_err(|err| format!("写入截图失败：{}", err))?;
+    writer
+        .StoreAsync()
+        .map_err(|err| format!("提交截图失败：{}", err))?
+        .get()
+        .map_err(|err| format!("提交截图失败：{}", err))?;
+    writer
+        .FlushAsync()
+        .map_err(|err| format!("刷新截图流失败：{}", err))?
+        .get()
+        .map_err(|err| format!("刷新截图流失败：{}", err))?;
+    stream.Seek(0).map_err(|err| format!("重置截图流失败：{}", err))?;
+
+    let decoder = BitmapDecoder::CreateAsync(&stream)
+        .map_err(|err| format!("创建截图解码器失败：{}", err))?
+        .get()
+        .map_err(|err| format!("解码截图失败：{}", err))?;
+    let bitmap = decoder
+        .GetSoftwareBitmapAsync()
+        .map_err(|err| format!("读取截图像素失败：{}", err))?
+        .get()
+        .map_err(|err| format!("读取截图像素失败：{}", err))?;
+    let bitmap = SoftwareBitmap::ConvertWithAlpha(
+        &bitmap,
+        BitmapPixelFormat::Bgra8,
+        BitmapAlphaMode::Premultiplied,
+    )
+    .map_err(|err| format!("转换截图像素格式失败：{}", err))?;
+    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
+        .map_err(|err| format!("创建 Windows OCR 引擎失败：{}", err))?;
+    let result = engine
+        .RecognizeAsync(&bitmap)
+        .map_err(|err| format!("OCR 调用失败：{}", err))?
+        .get()
+        .map_err(|err| format!("OCR 识别失败：{}", err))?;
+    result
+        .Text()
+        .map(|value| value.to_string())
+        .map_err(|err| format!("读取 OCR 文本失败：{}", err))
 }
 
 pub fn run() {
@@ -2321,34 +2591,13 @@ pub fn run() {
             let db_path = app_dir.join("3q-lang-helper.sqlite");
             let conn = Connection::open(db_path).map_err(|err| err.to_string())?;
             init_db(&conn)?;
+            let settings = load_settings_from_db(&conn).unwrap_or_else(|_| default_settings());
             app.manage(AppState {
                 db: Mutex::new(conn),
             });
-            let _ = app
-                .global_shortcut()
-                .on_shortcut("ctrl+alt+q", |app, _shortcut, event| {
-                    if event.state != ShortcutState::Pressed {
-                        return;
-                    }
-
-                    show_main_window(app);
-
-                    let _ = app.emit("3q-open-translate", ());
-                });
-
-            let _ = app
-                .global_shortcut()
-                .on_shortcut("ctrl+alt+s", |app, shortcut, event| {
-                    if event.state != ShortcutState::Pressed {
-                        return;
-                    }
-
-                    if shortcut.matches(Modifiers::CONTROL | Modifiers::ALT, Code::KeyS) {
-                        show_main_window(app);
-
-                        let _ = app.emit("3q-screenshot-translate", ());
-                    }
-                });
+            if register_configured_shortcuts(app.handle(), &settings).is_err() {
+                let _ = register_configured_shortcuts(app.handle(), &default_settings());
+            }
 
             let tray_menu = MenuBuilder::new(app)
                 .text("show", "显示主窗口")
@@ -2387,8 +2636,10 @@ pub fn run() {
             add_to_wordbook,
             list_wordbook,
             delete_wordbook_entry,
+            update_wordbook_entry_level,
             get_daily_items,
             get_settings,
+            test_api_provider,
             save_settings,
             capture_and_translate
         ])

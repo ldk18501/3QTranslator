@@ -328,6 +328,18 @@ button:disabled {
   font-size: 14px;
 }
 
+.error-text {
+  color: #b42318;
+}
+
+.action-row,
+.provider-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -346,6 +358,7 @@ button:disabled {
   align-items: center;
   color: #69758c;
   display: grid;
+  gap: 12px;
   min-height: 240px;
   place-items: center;
   text-align: center;
@@ -504,6 +517,33 @@ button:disabled {
   color: #6c778b;
 }
 
+.compact-field {
+  color: #47536a;
+  display: grid;
+  font-size: 13px;
+  gap: 6px;
+}
+
+.compact-field select {
+  height: 34px;
+}
+
+.word-details {
+  border-top: 1px solid #e4eaf2;
+  padding-top: 10px;
+}
+
+.word-details summary {
+  color: #2858d9;
+  cursor: pointer;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+
+.compact-definition {
+  grid-template-columns: 64px minmax(0, 1fr);
+}
+
 .danger-button {
   align-items: center;
   background: #fff4f2;
@@ -620,6 +660,12 @@ button:disabled {
   display: grid;
   font-size: 14px;
   gap: 8px;
+}
+
+.field-hint {
+  color: #6b7688;
+  font-size: 12px;
+  font-style: normal;
 }
 
 .toggle-inline {

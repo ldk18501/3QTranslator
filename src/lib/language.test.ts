@@ -7,6 +7,9 @@ describe("language helpers", () => {
     expect(detectLanguage("你好")).toBe("zh");
     expect(detectLanguage("こんにちは")).toBe("ja");
     expect(detectLanguage("안녕하세요")).toBe("ko");
+    expect(detectLanguage("hola, gracias")).toBe("es");
+    expect(detectLanguage("bonjour merci")).toBe("fr");
+    expect(detectLanguage("danke und hallo")).toBe("de");
   });
 
   it("uses Chinese as the default target for English", () => {

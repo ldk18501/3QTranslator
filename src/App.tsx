@@ -3,24 +3,34 @@ import {
   BookOpen,
   Camera,
   Check,
-  GraduationCap,
+  Clipboard,
+  Copy,
+  ExternalLink,
   Languages,
   Plus,
-  RotateCw,
   Search,
   Settings,
   Trash2,
 } from "lucide-react";
 import clsx from "clsx";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { addToWordbook, captureAndTranslate, deleteWordbookEntry, getDailyItems, getSettings, listWordbook, saveSettings, translateText } from "./lib/api";
+import {
+  addToWordbook,
+  captureAndTranslate,
+  deleteWordbookEntry,
+  getSettings,
+  listWordbook,
+  saveSettings,
+  testApiProvider,
+  translateText,
+  updateWordbookEntryLevel,
+} from "./lib/api";
 import { defaultTargetFor, languageLabel, languageOptions } from "./lib/language";
-import type { ApiProvider, AppSettings, DailyItem, Level, TranslationResult, ViewKey } from "./lib/types";
+import type { ApiProvider, AppSettings, Level, TranslationResult, ViewKey, WordbookEntry } from "./lib/types";
 
 const navItems: Array<{ key: ViewKey; label: string; icon: typeof Languages }> = [
   { key: "translate", label: "翻译", icon: Languages },
   { key: "wordbook", label: "单词本", icon: BookOpen },
-  { key: "daily", label: "每日学习", icon: GraduationCap },
   { key: "settings", label: "设置", icon: Settings },
 ];
 
@@ -40,6 +50,11 @@ const levelOrder: Record<Level, number> = {
 
 function levelLabel(level: Level): string {
   return levelOptions.find((item) => item.value === level)?.label ?? level;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 function App() {
@@ -94,10 +109,15 @@ function App() {
       </aside>
 
       <section className="workspace">
-        {view === "translate" && <TranslateView settings={settingsQuery.data} screenshotRequest={screenshotRequest} />}
-        {view === "wordbook" && <WordbookView />}
-        {view === "daily" && <DailyView settings={settingsQuery.data} />}
-        {view === "settings" && <SettingsView settings={settingsQuery.data} />}
+        <section hidden={view !== "translate"}>
+          <TranslateView settings={settingsQuery.data} screenshotRequest={screenshotRequest} />
+        </section>
+        <section hidden={view !== "wordbook"}>
+          <WordbookView onGoTranslate={() => setView("translate")} />
+        </section>
+        <section hidden={view !== "settings"}>
+          <SettingsView settings={settingsQuery.data} />
+        </section>
       </section>
     </main>
   );
@@ -112,7 +132,11 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
 
   const translateMutation = useMutation({
     mutationFn: () => translateText(text.trim(), targetLanguage || undefined),
-    onSuccess: setResult,
+    onSuccess: (value) => {
+      setNotice("");
+      setResult(value);
+    },
+    onError: (error) => setNotice(errorMessage(error)),
   });
 
   const addMutation = useMutation({
@@ -129,7 +153,7 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
       setResult(value);
       setText(value.sourceText);
     },
-    onError: (error) => setNotice(error instanceof Error ? error.message : "截图翻译暂不可用"),
+    onError: (error) => setNotice(errorMessage(error) || "截图翻译暂不可用"),
   });
 
   useEffect(() => {
@@ -176,7 +200,7 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
 
         <div className="result-panel">
           {result ? (
-            <TranslationCard result={result} onAdd={() => addMutation.mutate(result)} adding={addMutation.isPending} />
+            <TranslationCard result={result} onAdd={() => addMutation.mutate(result)} adding={addMutation.isPending} onNotice={setNotice} />
           ) : (
             <div className="empty-state">
               <Languages size={36} />
@@ -184,14 +208,33 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
             </div>
           )}
           {notice && <div className="toast">{notice}</div>}
-          {translateMutation.error && <div className="error-line">{String(translateMutation.error)}</div>}
+          {translateMutation.error && <div className="error-line">{errorMessage(translateMutation.error)}</div>}
         </div>
       </section>
     </div>
   );
 }
 
-function TranslationCard({ result, onAdd, adding }: { result: TranslationResult; onAdd: () => void; adding: boolean }) {
+function TranslationCard({
+  result,
+  onAdd,
+  adding,
+  onNotice,
+}: {
+  result: TranslationResult;
+  onAdd: () => void;
+  adding: boolean;
+  onNotice: (message: string) => void;
+}) {
+  const copyTranslation = async () => {
+    try {
+      await navigator.clipboard.writeText(result.translatedText);
+      onNotice("译文已复制");
+    } catch {
+      onNotice("复制失败，请手动选择译文复制");
+    }
+  };
+
   return (
     <article className="translation-card">
       <div className="result-meta">
@@ -235,15 +278,21 @@ function TranslationCard({ result, onAdd, adding }: { result: TranslationResult;
         </section>
       )}
 
-      <button className="secondary-button" onClick={onAdd} disabled={adding}>
-        <Plus size={16} />
-        {adding ? "保存中" : "加入单词本"}
-      </button>
+      <div className="action-row">
+        <button className="secondary-button" onClick={copyTranslation}>
+          <Copy size={16} />
+          复制译文
+        </button>
+        <button className="secondary-button" onClick={onAdd} disabled={adding}>
+          <Plus size={16} />
+          {adding ? "保存中" : "加入单词本"}
+        </button>
+      </div>
     </article>
   );
 }
 
-function WordbookView() {
+function WordbookView({ onGoTranslate }: { onGoTranslate: () => void }) {
   const [filter, setFilter] = useState("");
   const [selectedLanguage, setSelectedLanguage] = useState("");
   const [selectedLevel, setSelectedLevel] = useState<Level | "all">("all");
@@ -263,6 +312,10 @@ function WordbookView() {
 
   const deleteMutation = useMutation({
     mutationFn: (id: string) => deleteWordbookEntry(id),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["wordbook"] }),
+  });
+  const updateLevelMutation = useMutation({
+    mutationFn: ({ id, level }: { id: string; level: Level }) => updateWordbookEntryLevel(id, level),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["wordbook"] }),
   });
 
@@ -334,6 +387,10 @@ function WordbookView() {
         <div className="empty-state">
           <BookOpen size={36} />
           <p>还没有收藏内容。</p>
+          <button className="secondary-button" onClick={onGoTranslate}>
+            <ExternalLink size={16} />
+            去翻译添加
+          </button>
         </div>
       ) : filtered.length === 0 ? (
         <div className="empty-state">
@@ -345,26 +402,16 @@ function WordbookView() {
           <h2>{languageLabel(selectedLanguage)} · {filtered.length}</h2>
           <div className="word-grid">
             {filtered.map((item) => (
-              <article className="word-card" key={item.id}>
-                <div className="card-title">
-                  <strong>{item.text}</strong>
-                  <span>{new Date(item.createdAt).toLocaleDateString()}</span>
-                </div>
-                <div className="word-card-meta">
-                  <span>{levelLabel(item.level)}</span>
-                  <span>{item.source}</span>
-                </div>
-                <p>{item.translation}</p>
-                {item.examples[0] && <em>{item.examples[0]}</em>}
-                <button
-                  className="danger-button"
-                  disabled={deleteMutation.isPending}
-                  onClick={() => deleteMutation.mutate(item.id)}
-                >
-                  <Trash2 size={15} />
-                  删除
-                </button>
-              </article>
+              <WordbookCard
+                key={item.id}
+                item={item}
+                deleting={deleteMutation.isPending}
+                updatingLevel={updateLevelMutation.isPending}
+                onDelete={() => {
+                  if (window.confirm(`确定删除“${item.text}”？`)) deleteMutation.mutate(item.id);
+                }}
+                onLevelChange={(level) => updateLevelMutation.mutate({ id: item.id, level })}
+              />
             ))}
           </div>
         </section>
@@ -373,95 +420,72 @@ function WordbookView() {
   );
 }
 
-function DailyView({ settings }: { settings?: AppSettings }) {
-  const queryClient = useQueryClient();
-  const [language, setLanguage] = useState(settings?.dailyLanguage ?? "en");
-  const [level, setLevel] = useState<AppSettings["dailyLevel"]>(settings?.dailyLevel ?? "beginner");
-  const [forceRefresh, setForceRefresh] = useState(0);
-
-  useEffect(() => {
-    if (settings) {
-      setLanguage(settings.dailyLanguage);
-      setLevel(settings.dailyLevel);
-    }
-  }, [settings]);
-
-  const dailyQuery = useQuery({
-    queryKey: ["daily", language, level, forceRefresh],
-    queryFn: () => getDailyItems(language, level, forceRefresh > 0),
-  });
-
-  const settingsMutation = useMutation({
-    mutationFn: (value: AppSettings) => saveSettings(value),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["settings"] }),
-  });
-
-  const changeLanguage = (value: string) => {
-    setLanguage(value);
-    if (settings) settingsMutation.mutate({ ...settings, dailyLanguage: value, dailyLevel: level });
-  };
-
-  const changeLevel = (value: AppSettings["dailyLevel"]) => {
-    setLevel(value);
-    if (settings) settingsMutation.mutate({ ...settings, dailyLanguage: language, dailyLevel: value });
-  };
-
-  const addMutation = useMutation({
-    mutationFn: (item: DailyItem) => addToWordbook(item),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["wordbook"] }),
-  });
-
+function WordbookCard({
+  item,
+  deleting,
+  updatingLevel,
+  onDelete,
+  onLevelChange,
+}: {
+  item: WordbookEntry;
+  deleting: boolean;
+  updatingLevel: boolean;
+  onDelete: () => void;
+  onLevelChange: (level: Level) => void;
+}) {
   return (
-    <div className="page">
-      <header className="page-header">
-        <div>
-          <h1>每日学习</h1>
-          <p>每天 5 组单词与例句，适合打开软件后先热身。</p>
-        </div>
-        <div className="header-actions">
-          <select value={language} onChange={(event) => changeLanguage(event.target.value)}>
-            {languageOptions.map((item) => <option key={item.code} value={item.code}>{item.label}</option>)}
-          </select>
-          <select value={level} onChange={(event) => changeLevel(event.target.value as AppSettings["dailyLevel"])}>
-            {levelOptions.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-          </select>
-          <button className="icon-button" onClick={() => setForceRefresh((value) => value + 1)} title="刷新">
-            <RotateCw size={18} />
-          </button>
-        </div>
-      </header>
-
-      {dailyQuery.isFetching && <div className="inline-status">正在生成今日学习内容，首次生成会稍慢...</div>}
-
-      <div className="daily-grid">
-        {(dailyQuery.data ?? []).map((item) => (
-          <article className="daily-card" key={item.id}>
-            <div className="card-title">
-              <strong>{item.word}</strong>
-              <span>{item.translation}</span>
+    <article className="word-card">
+      <div className="card-title">
+        <strong>{item.text}</strong>
+        <span>{new Date(item.createdAt).toLocaleDateString()}</span>
+      </div>
+      <div className="word-card-meta">
+        <span>{languageLabel(item.language)} → {languageLabel(item.targetLanguage)}</span>
+        <span>{item.source}</span>
+      </div>
+      <label className="compact-field">
+        难度
+        <select value={item.level} disabled={updatingLevel} onChange={(event) => onLevelChange(event.target.value as Level)}>
+          {levelOptions.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      <p>{item.translation}</p>
+      {(item.definitions.length > 0 || item.examples.length > 0) && (
+        <details className="word-details">
+          <summary>完整内容</summary>
+          {item.definitions.map((definition, index) => (
+            <div className="definition-row compact-definition" key={`${definition.partOfSpeech}-${index}`}>
+              <span>{definition.partOfSpeech}</span>
+              <p>{definition.meaning}</p>
+              {definition.example && <em>{definition.example}</em>}
             </div>
-            <ul className="example-list daily-examples">
-              {item.examples.map((example, index) => (
-                <li key={example}>
-                  <span>{example}</span>
-                  {item.exampleTranslations[index] && <em>{item.exampleTranslations[index]}</em>}
-                </li>
+          ))}
+          {item.examples.length > 0 && (
+            <ul className="example-list">
+              {item.examples.map((example) => (
+                <li key={example}>{example}</li>
               ))}
             </ul>
-            <button className="secondary-button" onClick={() => addMutation.mutate(item)}>
-              <Plus size={16} />
-              加入单词本
-            </button>
-          </article>
-        ))}
-      </div>
-    </div>
+          )}
+        </details>
+      )}
+      <button className="danger-button" disabled={deleting} onClick={onDelete}>
+        <Trash2 size={15} />
+        删除
+      </button>
+    </article>
   );
 }
 
 function SettingsView({ settings }: { settings?: AppSettings }) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState<AppSettings | null>(settings ?? null);
+  const [notice, setNotice] = useState("");
+  const [testingProviderId, setTestingProviderId] = useState("");
 
   useEffect(() => {
     if (settings) setDraft(settings);
@@ -469,7 +493,20 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
 
   const saveMutation = useMutation({
     mutationFn: (value: AppSettings) => saveSettings(value),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["settings"] }),
+    onSuccess: () => {
+      setNotice("设置已保存");
+      queryClient.invalidateQueries({ queryKey: ["settings"] });
+    },
+    onError: (error) => setNotice(errorMessage(error)),
+  });
+  const providerTestMutation = useMutation({
+    mutationFn: (provider: ApiProvider) => testApiProvider(provider),
+    onMutate: (provider) => setTestingProviderId(provider.id),
+    onSuccess: (result) => {
+      setNotice(result.ok ? `连接可用：${result.translatedText ?? result.message}` : result.message);
+    },
+    onError: (error) => setNotice(errorMessage(error)),
+    onSettled: () => setTestingProviderId(""),
   });
 
   if (!draft) return <div className="empty-state">加载设置中</div>;
@@ -515,9 +552,10 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
         </div>
         <button className="primary-button" onClick={() => saveMutation.mutate(draft)}>
           <Check size={16} />
-          保存
+          {saveMutation.isPending ? "保存中" : "保存"}
         </button>
       </header>
+      {notice && <div className={clsx("inline-status", saveMutation.isError && "error-text")}>{notice}</div>}
 
       <section className="settings-grid">
         <label>
@@ -533,22 +571,14 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
           </select>
         </label>
         <label>
-          每日学习缓存上限
-          <input
-            type="number"
-            min={20}
-            max={1000}
-            value={draft.dailyCacheLimit}
-            onChange={(event) => set("dailyCacheLimit", Number(event.target.value) || 120)}
-          />
-        </label>
-        <label>
           呼出翻译窗口
           <input value={draft.shortcutTranslate} onChange={(event) => set("shortcutTranslate", event.target.value)} />
+          <em className="field-hint">例如 Ctrl+Alt+Q，保存后立即重新注册。</em>
         </label>
         <label>
           截图翻译
           <input value={draft.shortcutScreenshot} onChange={(event) => set("shortcutScreenshot", event.target.value)} />
+          <em className="field-hint">例如 Ctrl+Alt+S，若冲突会提示保存失败。</em>
         </label>
         <label className="toggle-field wide-field">
           <span>
@@ -645,6 +675,16 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
                     <input value={provider.model} onChange={(event) => updateProvider(provider.id, "model", event.target.value)} placeholder="gpt-4o-mini" />
                   </label>
                 )}
+              </div>
+              <div className="provider-actions">
+                <button
+                  className="secondary-button"
+                  disabled={providerTestMutation.isPending && testingProviderId === provider.id}
+                  onClick={() => providerTestMutation.mutate(provider)}
+                >
+                  <Clipboard size={16} />
+                  {providerTestMutation.isPending && testingProviderId === provider.id ? "测试中" : "测试连接"}
+                </button>
               </div>
             </article>
           ))}

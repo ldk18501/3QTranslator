@@ -1,4 +1,4 @@
-export type ViewKey = "translate" | "wordbook" | "daily" | "settings";
+export type ViewKey = "translate" | "wordbook" | "settings";
 
 export type Level = "zero" | "beginner" | "skilled" | "advanced";
 export type ProviderType = "mymemory" | "libretranslate" | "openai";
@@ -34,6 +34,12 @@ export interface WordbookEntry {
   level: Level;
   source: string;
   createdAt: string;
+}
+
+export interface ProviderTestResult {
+  ok: boolean;
+  message: string;
+  translatedText?: string;
 }
 
 export interface DailyItem {

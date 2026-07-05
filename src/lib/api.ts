@@ -1,4 +1,4 @@
-import type { ApiProvider, AppSettings, DailyItem, Level, TranslationResult, WordbookEntry } from "./types";
+import type { ApiProvider, AppSettings, DailyItem, Level, ProviderTestResult, TranslationResult, WordbookEntry } from "./types";
 import { fallbackDefinitions } from "./mockData";
 import { dailyFallback } from "./dailyWordBank";
 import { defaultTargetFor, detectLanguage, looksLikeWord } from "./language";
@@ -216,7 +216,8 @@ export async function addToWordbook(result: TranslationResult | DailyItem): Prom
         source: "daily learning",
         createdAt: new Date().toISOString(),
       };
-  writeLocal("wordbook", [entry, ...entries]);
+  const withoutDuplicate = entries.filter((item) => !(item.text === entry.text && item.language === entry.language && item.targetLanguage === entry.targetLanguage));
+  writeLocal("wordbook", [entry, ...withoutDuplicate]);
   return entry;
 }
 
@@ -236,6 +237,18 @@ export async function deleteWordbookEntry(id: string): Promise<void> {
   }
   const entries = await listWordbook();
   writeLocal("wordbook", entries.filter((item) => item.id !== id));
+}
+
+export async function updateWordbookEntryLevel(id: string, level: Level): Promise<WordbookEntry> {
+  if (isTauri) {
+    return tauriInvoke("update_wordbook_entry_level", { id, level });
+  }
+  const entries = await listWordbook();
+  const entry = entries.find((item) => item.id === id);
+  if (!entry) throw new Error("单词不存在");
+  const updated = { ...entry, level };
+  writeLocal("wordbook", entries.map((item) => (item.id === id ? updated : item)));
+  return updated;
 }
 
 export async function getDailyItems(language: string, level: AppSettings["dailyLevel"], forceRefresh = false): Promise<DailyItem[]> {
@@ -271,6 +284,22 @@ export async function saveSettings(settings: AppSettings): Promise<AppSettings> 
   }
   writeLocal("settings", settings);
   return settings;
+}
+
+export async function testApiProvider(provider: ApiProvider): Promise<ProviderTestResult> {
+  if (isTauri) {
+    return tauriInvoke("test_api_provider", { provider });
+  }
+  try {
+    const translatedText = provider.providerType === "libretranslate"
+      ? await translateWithLibre("hello", "en", "zh", provider)
+      : provider.providerType === "openai"
+        ? await translateWithOpenAi("hello", "en", "zh", provider)
+        : (await fallbackTranslate("hello", "zh")).translatedText;
+    return { ok: true, message: `${provider.name} 返回正常`, translatedText };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : "连接测试失败" };
+  }
 }
 
 export async function captureAndTranslate(): Promise<TranslationResult> {

@@ -30,11 +30,19 @@ export function languageLabel(code: string): string {
 }
 
 export function detectLanguage(text: string): string {
+  const sample = text.trim().toLowerCase();
   if (/[\u4e00-\u9fff]/.test(text)) return "zh";
   if (/[\u3040-\u30ff]/.test(text)) return "ja";
   if (/[\uac00-\ud7af]/.test(text)) return "ko";
   if (/[\u0400-\u04ff]/.test(text)) return "ru";
   if (/[\u0600-\u06ff]/.test(text)) return "ar";
+  if (/[àâæçèêëîïôœùûÿ]/.test(sample)) return "fr";
+  if (/[ñ¿¡]/.test(sample)) return "es";
+  if (/[äöüß]/.test(sample)) return "de";
+  if (/[ãõçáâêíóôú]/.test(sample)) return "pt";
+  if (/\b(el|la|los|las|una|unos|gracias|hola|por|para|que|con|estoy|está)\b/.test(sample)) return "es";
+  if (/\b(le|la|les|des|une|bonjour|merci|avec|pour|être|est|dans)\b/.test(sample)) return "fr";
+  if (/\b(der|die|das|und|ich|nicht|mit|für|ist|danke|hallo|ein|eine)\b/.test(sample)) return "de";
   return "en";
 }
 

@@ -25,4 +25,4 @@ tauri-plugin-single-instance = "2"
 urlencoding = "2"
 xcap = "0.0.10"
 image = "0.25"
-windows = { version = "0.58", features = ["Foundation", "Media_Ocr", "Graphics_Imaging", "Storage"] }
+windows = { version = "0.58", features = ["Foundation", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams"] }
