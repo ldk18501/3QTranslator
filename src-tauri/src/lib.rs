@@ -1,10 +1,13 @@
+use base64::{engine::general_purpose, Engine as _};
 use chrono::Local;
+use image::GenericImageView;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Cursor;
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{
     AppHandle,
     menu::MenuBuilder,
@@ -95,6 +98,23 @@ struct ProviderTestResult {
     translated_text: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScreenshotCapture {
+    image_data_url: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScreenshotRegion {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AppSettings {
@@ -108,6 +128,8 @@ struct AppSettings {
     shortcut_screenshot: String,
     #[serde(default = "default_close_to_tray")]
     close_to_tray: bool,
+    #[serde(default)]
+    launch_at_startup: bool,
     #[serde(default = "default_active_provider_id")]
     active_provider_id: String,
     #[serde(default = "default_api_providers")]
@@ -174,6 +196,7 @@ fn default_settings() -> AppSettings {
         shortcut_translate: "Ctrl+Alt+Q".into(),
         shortcut_screenshot: "Ctrl+Alt+S".into(),
         close_to_tray: default_close_to_tray(),
+        launch_at_startup: false,
         active_provider_id: default_active_provider_id(),
         api_providers: default_api_providers(),
         libre_translate_url: String::new(),
@@ -419,6 +442,36 @@ fn should_close_to_tray(window: &tauri::Window) -> bool {
         })
         .map(|settings| settings.close_to_tray)
         .unwrap_or(default_close_to_tray())
+}
+
+#[cfg(target_os = "windows")]
+fn set_launch_at_startup(enabled: bool) -> Result<(), String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (run_key, _) = hkcu
+        .create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .map_err(|err| format!("打开开机启动注册表失败：{}", err))?;
+    let app_name = "3Q语言助手";
+    if enabled {
+        let exe = std::env::current_exe().map_err(|err| format!("读取程序路径失败：{}", err))?;
+        run_key
+            .set_value(app_name, &format!("\"{}\"", exe.to_string_lossy()))
+            .map_err(|err| format!("设置开机启动失败：{}", err))?;
+    } else {
+        match run_key.delete_value(app_name) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("关闭开机启动失败：{}", err)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_launch_at_startup(_enabled: bool) -> Result<(), String> {
+    Ok(())
 }
 
 fn validate_shortcut(label: &str, shortcut: &str) -> Result<String, String> {
@@ -2456,6 +2509,11 @@ fn save_settings(
         let _ = register_configured_shortcuts(&app, &previous);
         return Err(err);
     }
+    if let Err(err) = set_launch_at_startup(settings.launch_at_startup) {
+        let _ = register_configured_shortcuts(&app, &previous);
+        let _ = set_launch_at_startup(previous.launch_at_startup);
+        return Err(err);
+    }
 
     let conn = state.db.lock().map_err(|err| err.to_string())?;
     if let Err(err) = conn.execute(
@@ -2463,6 +2521,7 @@ fn save_settings(
         params![serde_json::to_string(&settings).map_err(|err| err.to_string())?],
     ) {
         let _ = register_configured_shortcuts(&app, &previous);
+        let _ = set_launch_at_startup(previous.launch_at_startup);
         return Err(err.to_string());
     }
     Ok(settings)
@@ -2471,6 +2530,14 @@ fn save_settings(
 #[tauri::command]
 async fn capture_and_translate(state: State<'_, AppState>) -> Result<TranslationResult, String> {
     let clean_text = ocr_primary_monitor_text().await?;
+    translate_ocr_text(state, clean_text, "Windows OCR").await
+}
+
+async fn translate_ocr_text(
+    state: State<'_, AppState>,
+    clean_text: String,
+    source_label: &str,
+) -> Result<TranslationResult, String> {
     let settings = {
         let conn = state.db.lock().map_err(|err| err.to_string())?;
         load_settings_from_db(&conn)?
@@ -2495,12 +2562,60 @@ async fn capture_and_translate(state: State<'_, AppState>) -> Result<Translation
         definitions,
         examples,
         phrases,
-        provider: format!("{} + Windows OCR", provider_name),
+        provider: format!("{} + {}", provider_name, source_label),
         is_word,
     })
 }
 
+#[tauri::command]
+async fn capture_screenshot(app: AppHandle) -> Result<ScreenshotCapture, String> {
+    let window = app.get_webview_window("main");
+    if let Some(window) = &window {
+        let _ = window.hide();
+        std::thread::sleep(Duration::from_millis(180));
+    }
+    let capture = capture_primary_monitor_png();
+    if let Some(window) = &window {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    let (png, width, height) = capture?;
+    Ok(ScreenshotCapture {
+        image_data_url: format!(
+            "data:image/png;base64,{}",
+            general_purpose::STANDARD.encode(png)
+        ),
+        width,
+        height,
+    })
+}
+
+#[tauri::command]
+async fn translate_screenshot_region(
+    state: State<'_, AppState>,
+    image_data_url: String,
+    region: ScreenshotRegion,
+) -> Result<TranslationResult, String> {
+    let png = crop_screenshot_region(&image_data_url, &region)?;
+    let text = recognize_png_bytes_with_windows_ocr(&png).await?;
+    let clean_text = clean_ocr_text(&text);
+    if clean_text.is_empty() {
+        return Err("选区中没有识别到文字".into());
+    }
+    translate_ocr_text(state, clean_text, "Windows OCR 选区").await
+}
+
 async fn ocr_primary_monitor_text() -> Result<String, String> {
+    let (png, _, _) = capture_primary_monitor_png()?;
+    let text = recognize_png_bytes_with_windows_ocr(&png).await?;
+    let clean_text = clean_ocr_text(&text);
+    if clean_text.is_empty() {
+        return Err("截图中没有识别到文字".into());
+    }
+    Ok(clean_text)
+}
+
+fn capture_primary_monitor_png() -> Result<(Vec<u8>, u32, u32), String> {
     let monitors = xcap::Monitor::all().map_err(|err| format!("无法读取显示器：{}", err))?;
     let monitor = monitors
         .iter()
@@ -2510,23 +2625,57 @@ async fn ocr_primary_monitor_text() -> Result<String, String> {
     let image = monitor
         .capture_image()
         .map_err(|err| format!("截图失败：{}", err))?;
-
+    let (width, height) = image.dimensions();
     let mut png = Vec::new();
     image::DynamicImage::ImageRgba8(image)
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
         .map_err(|err| format!("截图编码失败：{}", err))?;
+    Ok((png, width, height))
+}
 
-    let text = recognize_png_bytes_with_windows_ocr(&png).await?;
-    let clean_text = text
+fn clean_ocr_text(text: &str) -> String {
+    text
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
-    if clean_text.is_empty() {
-        return Err("截图中没有识别到文字".into());
+        .join("\n")
+}
+
+fn crop_screenshot_region(image_data_url: &str, region: &ScreenshotRegion) -> Result<Vec<u8>, String> {
+    if region.width < 4.0 || region.height < 4.0 {
+        return Err("请先框选需要识别的区域".into());
     }
-    Ok(clean_text)
+    let encoded = image_data_url
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(image_data_url);
+    let bytes = general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| format!("读取截图数据失败：{}", err))?;
+    let image = image::load_from_memory(&bytes).map_err(|err| format!("解析截图失败：{}", err))?;
+    let (image_width, image_height) = image.dimensions();
+    let x = region.x.max(0.0).min(image_width.saturating_sub(1) as f64).round() as u32;
+    let y = region.y.max(0.0).min(image_height.saturating_sub(1) as f64).round() as u32;
+    let right = (region.x + region.width)
+        .max((x + 1) as f64)
+        .min(image_width as f64)
+        .round() as u32;
+    let bottom = (region.y + region.height)
+        .max((y + 1) as f64)
+        .min(image_height as f64)
+        .round() as u32;
+    let width = right.saturating_sub(x);
+    let height = bottom.saturating_sub(y);
+    if width < 4 || height < 4 {
+        return Err("选区太小，请重新框选".into());
+    }
+    let cropped = image.crop_imm(x, y, width, height);
+    let mut png = Vec::new();
+    cropped
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|err| format!("选区编码失败：{}", err))?;
+    Ok(png)
 }
 
 async fn recognize_png_bytes_with_windows_ocr(png: &[u8]) -> Result<String, String> {
@@ -2598,6 +2747,7 @@ pub fn run() {
             if register_configured_shortcuts(app.handle(), &settings).is_err() {
                 let _ = register_configured_shortcuts(app.handle(), &default_settings());
             }
+            let _ = set_launch_at_startup(settings.launch_at_startup);
 
             let tray_menu = MenuBuilder::new(app)
                 .text("show", "显示主窗口")
@@ -2641,7 +2791,9 @@ pub fn run() {
             get_settings,
             test_api_provider,
             save_settings,
-            capture_and_translate
+            capture_and_translate,
+            capture_screenshot,
+            translate_screenshot_region
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {

@@ -1,4 +1,4 @@
-import type { ApiProvider, AppSettings, DailyItem, Level, ProviderTestResult, TranslationResult, WordbookEntry } from "./types";
+import type { ApiProvider, AppSettings, DailyItem, Level, ProviderTestResult, ScreenshotCapture, ScreenshotRegion, TranslationResult, WordbookEntry } from "./types";
 import { fallbackDefinitions } from "./mockData";
 import { dailyFallback } from "./dailyWordBank";
 import { defaultTargetFor, detectLanguage, looksLikeWord } from "./language";
@@ -19,6 +19,7 @@ const defaultSettings: AppSettings = {
   shortcutTranslate: "Ctrl+Alt+Q",
   shortcutScreenshot: "Ctrl+Alt+S",
   closeToTray: true,
+  launchAtStartup: false,
   activeProviderId: "mymemory",
   apiProviders: [
     { id: "mymemory", name: "MyMemory 免费源", providerType: "mymemory", enabled: true, baseUrl: "", apiKey: "", model: "" },
@@ -305,6 +306,20 @@ export async function testApiProvider(provider: ApiProvider): Promise<ProviderTe
 export async function captureAndTranslate(): Promise<TranslationResult> {
   if (isTauri) {
     return tauriInvoke("capture_and_translate");
+  }
+  throw new Error("截图翻译需要在 Tauri 桌面端运行。");
+}
+
+export async function captureScreenshot(): Promise<ScreenshotCapture> {
+  if (isTauri) {
+    return tauriInvoke("capture_screenshot");
+  }
+  throw new Error("截图翻译需要在 Tauri 桌面端运行。");
+}
+
+export async function translateScreenshotRegion(imageDataUrl: string, region: ScreenshotRegion): Promise<TranslationResult> {
+  if (isTauri) {
+    return tauriInvoke("translate_screenshot_region", { imageDataUrl, region });
   }
   throw new Error("截图翻译需要在 Tauri 桌面端运行。");
 }

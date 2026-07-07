@@ -42,6 +42,19 @@ export interface ProviderTestResult {
   translatedText?: string;
 }
 
+export interface ScreenshotCapture {
+  imageDataUrl: string;
+  width: number;
+  height: number;
+}
+
+export interface ScreenshotRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface DailyItem {
   id: string;
   word: string;
@@ -71,6 +84,7 @@ export interface AppSettings {
   shortcutTranslate: string;
   shortcutScreenshot: string;
   closeToTray: boolean;
+  launchAtStartup: boolean;
   activeProviderId: string;
   apiProviders: ApiProvider[];
   libreTranslateUrl: string;

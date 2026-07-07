@@ -14,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
 directories = "5"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -26,3 +27,4 @@ urlencoding = "2"
 xcap = "0.0.10"
 image = "0.25"
 windows = { version = "0.58", features = ["Foundation", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams"] }
+winreg = "0.52"

@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from "react";
 import {
   BookOpen,
   Camera,
@@ -8,25 +9,28 @@ import {
   ExternalLink,
   Languages,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   Trash2,
+  X,
 } from "lucide-react";
 import clsx from "clsx";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addToWordbook,
-  captureAndTranslate,
+  captureScreenshot,
   deleteWordbookEntry,
   getSettings,
   listWordbook,
   saveSettings,
   testApiProvider,
   translateText,
+  translateScreenshotRegion,
   updateWordbookEntryLevel,
 } from "./lib/api";
 import { defaultTargetFor, languageLabel, languageOptions } from "./lib/language";
-import type { ApiProvider, AppSettings, Level, TranslationResult, ViewKey, WordbookEntry } from "./lib/types";
+import type { ApiProvider, AppSettings, Level, ScreenshotCapture, ScreenshotRegion, TranslationResult, ViewKey, WordbookEntry } from "./lib/types";
 
 const navItems: Array<{ key: ViewKey; label: string; icon: typeof Languages }> = [
   { key: "translate", label: "翻译", icon: Languages },
@@ -55,6 +59,19 @@ function levelLabel(level: Level): string {
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+function shortcutFromKeyboardEvent(event: ReactKeyboardEvent<HTMLInputElement>): string | null {
+  const key = event.key;
+  if (["Control", "Shift", "Alt", "Meta"].includes(key)) return null;
+  const parts: string[] = [];
+  if (event.ctrlKey) parts.push("Ctrl");
+  if (event.altKey) parts.push("Alt");
+  if (event.shiftKey) parts.push("Shift");
+  if (event.metaKey) parts.push("Meta");
+  const normalizedKey = key.length === 1 ? key.toUpperCase() : key.replace(/^Arrow/, "");
+  parts.push(normalizedKey);
+  return parts.length >= 2 ? parts.join("+") : null;
 }
 
 function App() {
@@ -129,6 +146,7 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
   const [targetLanguage, setTargetLanguage] = useState("");
   const [result, setResult] = useState<TranslationResult | null>(null);
   const [notice, setNotice] = useState("");
+  const [screenshot, setScreenshot] = useState<ScreenshotCapture | null>(null);
 
   const translateMutation = useMutation({
     mutationFn: () => translateText(text.trim(), targetLanguage || undefined),
@@ -148,12 +166,23 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
   });
 
   const captureMutation = useMutation({
-    mutationFn: captureAndTranslate,
+    mutationFn: captureScreenshot,
+    onSuccess: (value) => {
+      setNotice("");
+      setScreenshot(value);
+    },
+    onError: (error) => setNotice(errorMessage(error) || "截图翻译暂不可用"),
+  });
+
+  const regionMutation = useMutation({
+    mutationFn: ({ imageDataUrl, region }: { imageDataUrl: string; region: ScreenshotRegion }) => translateScreenshotRegion(imageDataUrl, region),
     onSuccess: (value) => {
       setResult(value);
       setText(value.sourceText);
+      setScreenshot(null);
+      setNotice("");
     },
-    onError: (error) => setNotice(errorMessage(error) || "截图翻译暂不可用"),
+    onError: (error) => setNotice(errorMessage(error) || "选区识别失败"),
   });
 
   useEffect(() => {
@@ -181,7 +210,7 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
             ))}
           </select>
           <button className="icon-button" onClick={() => captureMutation.mutate()} title="截图翻译">
-            <Camera size={18} />
+            {captureMutation.isPending ? <RefreshCw size={18} /> : <Camera size={18} />}
           </button>
         </div>
       </header>
@@ -210,6 +239,120 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
           {notice && <div className="toast">{notice}</div>}
           {translateMutation.error && <div className="error-line">{errorMessage(translateMutation.error)}</div>}
         </div>
+      </section>
+
+      {screenshot && (
+        <ScreenshotSelector
+          screenshot={screenshot}
+          pending={regionMutation.isPending}
+          onClose={() => setScreenshot(null)}
+          onRetry={() => captureMutation.mutate()}
+          onSubmit={(region) => regionMutation.mutate({ imageDataUrl: screenshot.imageDataUrl, region })}
+        />
+      )}
+    </div>
+  );
+}
+
+function ScreenshotSelector({
+  screenshot,
+  pending,
+  onClose,
+  onRetry,
+  onSubmit,
+}: {
+  screenshot: ScreenshotCapture;
+  pending: boolean;
+  onClose: () => void;
+  onRetry: () => void;
+  onSubmit: (region: ScreenshotRegion) => void;
+}) {
+  const imageRef = useRef<HTMLImageElement | null>(null);
+  const [selection, setSelection] = useState<ScreenshotRegion | null>(null);
+  const [dragStart, setDragStart] = useState<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    setSelection(null);
+    setDragStart(null);
+  }, [screenshot.imageDataUrl]);
+
+  const pointFromEvent = (event: ReactMouseEvent): { x: number; y: number } => {
+    const rect = imageRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    const x = Math.min(Math.max(event.clientX - rect.left, 0), rect.width);
+    const y = Math.min(Math.max(event.clientY - rect.top, 0), rect.height);
+    return {
+      x: (x / rect.width) * screenshot.width,
+      y: (y / rect.height) * screenshot.height,
+    };
+  };
+
+  const beginSelection = (event: ReactMouseEvent) => {
+    const point = pointFromEvent(event);
+    setDragStart(point);
+    setSelection({ x: point.x, y: point.y, width: 0, height: 0 });
+  };
+
+  const updateSelection = (event: ReactMouseEvent) => {
+    if (!dragStart) return;
+    const point = pointFromEvent(event);
+    setSelection({
+      x: Math.min(dragStart.x, point.x),
+      y: Math.min(dragStart.y, point.y),
+      width: Math.abs(point.x - dragStart.x),
+      height: Math.abs(point.y - dragStart.y),
+    });
+  };
+
+  const finishSelection = () => {
+    setDragStart(null);
+  };
+
+  const selectionStyle = selection
+    ? {
+        left: `${(selection.x / screenshot.width) * 100}%`,
+        top: `${(selection.y / screenshot.height) * 100}%`,
+        width: `${(selection.width / screenshot.width) * 100}%`,
+        height: `${(selection.height / screenshot.height) * 100}%`,
+      }
+    : undefined;
+  const canSubmit = Boolean(selection && selection.width >= 8 && selection.height >= 8);
+
+  return (
+    <div className="modal-backdrop">
+      <section className="screenshot-modal">
+        <header className="modal-header">
+          <div>
+            <h2>框选截图翻译区域</h2>
+            <p>拖动鼠标选择需要识别的文字区域，选错后可以直接重新框选。</p>
+          </div>
+          <button className="icon-button" onClick={onClose} title="关闭">
+            <X size={18} />
+          </button>
+        </header>
+        <div
+          className="screenshot-stage"
+          onMouseDown={beginSelection}
+          onMouseMove={updateSelection}
+          onMouseUp={finishSelection}
+          onMouseLeave={finishSelection}
+        >
+          <img ref={imageRef} src={screenshot.imageDataUrl} alt="截图预览" draggable={false} />
+          {selectionStyle && <div className="selection-rect" style={selectionStyle} />}
+        </div>
+        <footer className="modal-footer">
+          <span>{selection ? `选区 ${Math.round(selection.width)} × ${Math.round(selection.height)}` : "尚未选择区域"}</span>
+          <div className="action-row">
+            <button className="secondary-button" onClick={onRetry}>
+              <Camera size={16} />
+              重新截图
+            </button>
+            <button className="primary-button" disabled={!canSubmit || pending} onClick={() => selection && onSubmit(selection)}>
+              <Search size={16} />
+              {pending ? "识别中" : "识别并翻译"}
+            </button>
+          </div>
+        </footer>
       </section>
     </div>
   );
@@ -481,6 +624,29 @@ function WordbookCard({
   );
 }
 
+function ShortcutInput({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [recording, setRecording] = useState(false);
+  return (
+    <input
+      className={clsx(recording && "recording-shortcut")}
+      readOnly
+      value={value}
+      onFocus={() => setRecording(true)}
+      onBlur={() => setRecording(false)}
+      onKeyDown={(event) => {
+        event.preventDefault();
+        const shortcut = shortcutFromKeyboardEvent(event);
+        if (shortcut) {
+          onChange(shortcut);
+          setRecording(false);
+          event.currentTarget.blur();
+        }
+      }}
+      placeholder="点击后按组合键"
+    />
+  );
+}
+
 function SettingsView({ settings }: { settings?: AppSettings }) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState<AppSettings | null>(settings ?? null);
@@ -572,13 +738,13 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
         </label>
         <label>
           呼出翻译窗口
-          <input value={draft.shortcutTranslate} onChange={(event) => set("shortcutTranslate", event.target.value)} />
-          <em className="field-hint">例如 Ctrl+Alt+Q，保存后立即重新注册。</em>
+          <ShortcutInput value={draft.shortcutTranslate} onChange={(value) => set("shortcutTranslate", value)} />
+          <em className="field-hint">点击输入框后直接按组合键，例如 Alt+L，保存后立即重新注册。</em>
         </label>
         <label>
           截图翻译
-          <input value={draft.shortcutScreenshot} onChange={(event) => set("shortcutScreenshot", event.target.value)} />
-          <em className="field-hint">例如 Ctrl+Alt+S，若冲突会提示保存失败。</em>
+          <ShortcutInput value={draft.shortcutScreenshot} onChange={(value) => set("shortcutScreenshot", value)} />
+          <em className="field-hint">点击输入框后直接按组合键，若冲突会提示保存失败。</em>
         </label>
         <label className="toggle-field wide-field">
           <span>
@@ -589,6 +755,17 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
             type="checkbox"
             checked={draft.closeToTray}
             onChange={(event) => set("closeToTray", event.target.checked)}
+          />
+        </label>
+        <label className="toggle-field wide-field">
+          <span>
+            <strong>开机自动启动</strong>
+            <em>开启后登录 Windows 时自动启动 3Q 语言助手。</em>
+          </span>
+          <input
+            type="checkbox"
+            checked={draft.launchAtStartup}
+            onChange={(event) => set("launchAtStartup", event.target.checked)}
           />
         </label>
         <label className="wide-field">
