@@ -1,12 +1,14 @@
 export type ViewKey = "translate" | "wordbook" | "settings";
 
 export type Level = "zero" | "beginner" | "skilled" | "advanced";
-export type ProviderType = "mymemory" | "libretranslate" | "openai";
+export type ProviderType = "mymemory" | "libretranslate" | "openai" | "tencent" | "azure" | "deepl" | "baidu";
 
 export interface Definition {
   partOfSpeech: string;
   meaning: string;
+  meaningTranslation?: string;
   example?: string;
+  exampleTranslation?: string;
   synonyms?: string[];
 }
 
@@ -18,6 +20,7 @@ export interface TranslationResult {
   phonetic?: string;
   definitions: Definition[];
   examples: string[];
+  exampleTranslations: string[];
   phrases: string[];
   provider: string;
   isWord: boolean;
@@ -72,6 +75,8 @@ export interface ApiProvider {
   enabled: boolean;
   baseUrl: string;
   apiKey: string;
+  apiSecret: string;
+  region: string;
   model: string;
 }
 

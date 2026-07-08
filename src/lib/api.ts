@@ -22,9 +22,13 @@ const defaultSettings: AppSettings = {
   launchAtStartup: false,
   activeProviderId: "mymemory",
   apiProviders: [
-    { id: "mymemory", name: "MyMemory 免费源", providerType: "mymemory", enabled: true, baseUrl: "", apiKey: "", model: "" },
-    { id: "libre-default", name: "LibreTranslate", providerType: "libretranslate", enabled: false, baseUrl: "", apiKey: "", model: "" },
-    { id: "openai-default", name: "OpenAI-compatible", providerType: "openai", enabled: false, baseUrl: "", apiKey: "", model: "gpt-4o-mini" },
+    { id: "mymemory", name: "MyMemory 免费源", providerType: "mymemory", enabled: true, baseUrl: "", apiKey: "", apiSecret: "", region: "", model: "" },
+    { id: "libre-default", name: "LibreTranslate", providerType: "libretranslate", enabled: false, baseUrl: "", apiKey: "", apiSecret: "", region: "", model: "" },
+    { id: "openai-default", name: "OpenAI-compatible", providerType: "openai", enabled: false, baseUrl: "", apiKey: "", apiSecret: "", region: "", model: "gpt-4o-mini" },
+    { id: "tencent-default", name: "腾讯云机器翻译", providerType: "tencent", enabled: false, baseUrl: "https://tmt.tencentcloudapi.com", apiKey: "", apiSecret: "", region: "ap-guangzhou", model: "" },
+    { id: "azure-default", name: "Azure Translator", providerType: "azure", enabled: false, baseUrl: "https://api.cognitive.microsofttranslator.com", apiKey: "", apiSecret: "", region: "", model: "" },
+    { id: "deepl-default", name: "DeepL API", providerType: "deepl", enabled: false, baseUrl: "https://api-free.deepl.com/v2", apiKey: "", apiSecret: "", region: "", model: "" },
+    { id: "baidu-default", name: "百度翻译开放平台", providerType: "baidu", enabled: false, baseUrl: "https://fanyi-api.baidu.com/api/trans/vip/translate", apiKey: "", apiSecret: "", region: "", model: "" },
   ],
   libreTranslateUrl: "",
   openAiBaseUrl: "",
@@ -170,6 +174,7 @@ async function fallbackTranslate(text: string, targetLanguage?: string): Promise
     phonetic,
     definitions,
     examples: examples.slice(0, 6),
+    exampleTranslations: [],
     phrases,
     provider: providerName,
     isWord: word,
@@ -197,7 +202,10 @@ export async function addToWordbook(result: TranslationResult | DailyItem): Prom
         targetLanguage: result.targetLanguage,
         translation: result.translatedText,
         definitions: result.definitions,
-        examples: result.examples,
+        examples: result.examples.map((example, index) => {
+          const translated = result.exampleTranslations[index];
+          return translated ? `${example}\n${translated}` : example;
+        }),
         level: inferDifficulty(result.sourceText, result.definitions.length, result.examples.length),
         source: result.provider,
         createdAt: new Date().toISOString(),
@@ -274,9 +282,23 @@ export async function getSettings(): Promise<AppSettings> {
   return {
     ...defaultSettings,
     ...saved,
-    apiProviders: saved.apiProviders?.length ? saved.apiProviders : defaultSettings.apiProviders,
+    apiProviders: normalizeApiProviders(saved.apiProviders),
     activeProviderId: saved.activeProviderId ?? defaultSettings.activeProviderId,
   };
+}
+
+function normalizeApiProviders(saved?: ApiProvider[]): ApiProvider[] {
+  const providers = (saved?.length ? saved : defaultSettings.apiProviders).map((provider) => ({
+    ...provider,
+    apiSecret: provider.apiSecret ?? "",
+    region: provider.region ?? "",
+  }));
+  for (const defaultProvider of defaultSettings.apiProviders) {
+    if (!providers.some((provider) => provider.id === defaultProvider.id)) {
+      providers.push(defaultProvider);
+    }
+  }
+  return providers;
 }
 
 export async function saveSettings(settings: AppSettings): Promise<AppSettings> {
@@ -315,6 +337,12 @@ export async function captureScreenshot(): Promise<ScreenshotCapture> {
     return tauriInvoke("capture_screenshot");
   }
   throw new Error("截图翻译需要在 Tauri 桌面端运行。");
+}
+
+export async function exitScreenshotMode(): Promise<void> {
+  if (isTauri) {
+    return tauriInvoke("exit_screenshot_mode");
+  }
 }
 
 export async function translateScreenshotRegion(imageDataUrl: string, region: ScreenshotRegion): Promise<TranslationResult> {

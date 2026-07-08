@@ -1,9 +1,11 @@
 use base64::{engine::general_purpose, Engine as _};
-use chrono::Local;
-use image::GenericImageView;
+use chrono::{Local, Utc};
+use hmac::{Hmac, Mac};
+use image::{imageops::FilterType, GenericImageView};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Cursor;
 use std::sync::Mutex;
@@ -25,7 +27,11 @@ struct AppState {
 struct Definition {
     part_of_speech: String,
     meaning: String,
+    #[serde(default)]
+    meaning_translation: Option<String>,
     example: Option<String>,
+    #[serde(default)]
+    example_translation: Option<String>,
     synonyms: Option<Vec<String>>,
 }
 
@@ -39,6 +45,8 @@ struct TranslationResult {
     phonetic: Option<String>,
     definitions: Vec<Definition>,
     examples: Vec<String>,
+    #[serde(default)]
+    example_translations: Vec<String>,
     phrases: Vec<String>,
     provider: String,
     is_word: bool,
@@ -87,6 +95,10 @@ struct ApiProvider {
     enabled: bool,
     base_url: String,
     api_key: String,
+    #[serde(default)]
+    api_secret: String,
+    #[serde(default)]
+    region: String,
     model: String,
 }
 
@@ -163,6 +175,8 @@ fn default_api_providers() -> Vec<ApiProvider> {
             enabled: true,
             base_url: String::new(),
             api_key: String::new(),
+            api_secret: String::new(),
+            region: String::new(),
             model: String::new(),
         },
         ApiProvider {
@@ -172,6 +186,8 @@ fn default_api_providers() -> Vec<ApiProvider> {
             enabled: false,
             base_url: String::new(),
             api_key: String::new(),
+            api_secret: String::new(),
+            region: String::new(),
             model: String::new(),
         },
         ApiProvider {
@@ -181,7 +197,53 @@ fn default_api_providers() -> Vec<ApiProvider> {
             enabled: false,
             base_url: String::new(),
             api_key: String::new(),
+            api_secret: String::new(),
+            region: String::new(),
             model: "gpt-4o-mini".into(),
+        },
+        ApiProvider {
+            id: "tencent-default".into(),
+            name: "腾讯云机器翻译".into(),
+            provider_type: "tencent".into(),
+            enabled: false,
+            base_url: "https://tmt.tencentcloudapi.com".into(),
+            api_key: String::new(),
+            api_secret: String::new(),
+            region: "ap-guangzhou".into(),
+            model: String::new(),
+        },
+        ApiProvider {
+            id: "azure-default".into(),
+            name: "Azure Translator".into(),
+            provider_type: "azure".into(),
+            enabled: false,
+            base_url: "https://api.cognitive.microsofttranslator.com".into(),
+            api_key: String::new(),
+            api_secret: String::new(),
+            region: String::new(),
+            model: String::new(),
+        },
+        ApiProvider {
+            id: "deepl-default".into(),
+            name: "DeepL API".into(),
+            provider_type: "deepl".into(),
+            enabled: false,
+            base_url: "https://api-free.deepl.com/v2".into(),
+            api_key: String::new(),
+            api_secret: String::new(),
+            region: String::new(),
+            model: String::new(),
+        },
+        ApiProvider {
+            id: "baidu-default".into(),
+            name: "百度翻译开放平台".into(),
+            provider_type: "baidu".into(),
+            enabled: false,
+            base_url: "https://fanyi-api.baidu.com/api/trans/vip/translate".into(),
+            api_key: String::new(),
+            api_secret: String::new(),
+            region: String::new(),
+            model: String::new(),
         },
     ]
 }
@@ -418,6 +480,31 @@ fn normalize_settings(mut settings: AppSettings) -> AppSettings {
         settings.active_provider_id = default_active_provider_id();
     }
 
+    for default_provider in default_api_providers() {
+        if !settings
+            .api_providers
+            .iter()
+            .any(|provider| provider.id == default_provider.id)
+        {
+            settings.api_providers.push(default_provider);
+        }
+    }
+
+    for provider in settings.api_providers.iter_mut() {
+        if provider.provider_type == "tencent" && provider.base_url.trim().is_empty() {
+            provider.base_url = "https://tmt.tencentcloudapi.com".into();
+        } else if provider.provider_type == "azure" && provider.base_url.trim().is_empty() {
+            provider.base_url = "https://api.cognitive.microsofttranslator.com".into();
+        } else if provider.provider_type == "deepl" && provider.base_url.trim().is_empty() {
+            provider.base_url = "https://api-free.deepl.com/v2".into();
+        } else if provider.provider_type == "baidu" && provider.base_url.trim().is_empty() {
+            provider.base_url = "https://fanyi-api.baidu.com/api/trans/vip/translate".into();
+        }
+        if provider.provider_type == "tencent" && provider.region.trim().is_empty() {
+            provider.region = "ap-guangzhou".into();
+        }
+    }
+
     settings
 }
 
@@ -526,11 +613,183 @@ async fn translate_with_mymemory(text: &str, source: &str, target: &str) -> Opti
         urlencoding::encode(text),
         urlencoding::encode(&lang_pair)
     );
-    let response = reqwest::get(url).await.ok()?;
+    let response = reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
     let data = response.json::<Value>().await.ok()?;
     data.pointer("/responseData/translatedText")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+async fn translate_with_google_free(text: &str, source: &str, target: &str) -> Option<String> {
+    let source = if source.trim().is_empty() { "auto" } else { source };
+    let url = format!(
+        "https://translate.googleapis.com/translate_a/single?client=gtx&sl={}&tl={}&dt=t&q={}",
+        urlencoding::encode(source),
+        urlencoding::encode(target),
+        urlencoding::encode(text)
+    );
+    let response = reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    let data = response.json::<Value>().await.ok()?;
+    let translated = data
+        .get(0)
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|item| item.get(0).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    Some(translated).filter(|value| !value.trim().is_empty())
+}
+
+fn normalized_translation_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_whitespace() && !ch.is_ascii_punctuation())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn translation_is_useful(source: &str, translated: &str, source_language: &str, target_language: &str) -> bool {
+    let translated = translated.trim();
+    if translated.is_empty() {
+        return false;
+    }
+    if source_language != target_language
+        && normalized_translation_text(source) == normalized_translation_text(translated)
+    {
+        return false;
+    }
+    true
+}
+
+fn provider_base_url<'a>(provider: &'a ApiProvider, fallback: &'a str) -> String {
+    let value = provider.base_url.trim().trim_end_matches('/');
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn azure_language(code: &str) -> &str {
+    match code {
+        "zh" => "zh-Hans",
+        "pt" => "pt-PT",
+        value => value,
+    }
+}
+
+fn deepl_language(code: &str, target: bool) -> &str {
+    match code {
+        "zh" => "ZH",
+        "en" if target => "EN-US",
+        "en" => "EN",
+        "ja" => "JA",
+        "ko" => "KO",
+        "fr" => "FR",
+        "de" => "DE",
+        "es" => "ES",
+        "ru" => "RU",
+        "it" => "IT",
+        "pt" if target => "PT-PT",
+        "pt" => "PT",
+        value => value,
+    }
+}
+
+fn baidu_language(code: &str) -> &str {
+    match code {
+        "zh" => "zh",
+        "ja" => "jp",
+        "ko" => "kor",
+        "fr" => "fra",
+        "es" => "spa",
+        "pt" => "pt",
+        value => value,
+    }
+}
+
+fn tencent_language(code: &str) -> &str {
+    match code {
+        "zh" => "zh",
+        "ja" => "ja",
+        "ko" => "ko",
+        "fr" => "fr",
+        "de" => "de",
+        "es" => "es",
+        "ru" => "ru",
+        "it" => "it",
+        "pt" => "pt",
+        value => value,
+    }
+}
+
+fn hmac_sha256(key: &[u8], message: &str) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(message.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn provider_config_error(provider: &ApiProvider) -> Option<String> {
+    match provider.provider_type.as_str() {
+        "tencent" => {
+            if provider.api_key.trim().is_empty() {
+                Some("腾讯云 SecretId 不能为空".into())
+            } else if provider.api_secret.trim().is_empty() {
+                Some("腾讯云 SecretKey 不能为空".into())
+            } else {
+                None
+            }
+        }
+        "azure" => {
+            if provider.api_key.trim().is_empty() {
+                Some("Azure API Key 不能为空".into())
+            } else if provider.region.trim().is_empty() {
+                Some("Azure 区域不能为空，请填写资源所在区域，例如 eastasia".into())
+            } else {
+                None
+            }
+        }
+        "deepl" => {
+            if provider.api_key.trim().is_empty() {
+                Some("DeepL API Key 不能为空".into())
+            } else {
+                None
+            }
+        }
+        "baidu" => {
+            if provider.api_key.trim().is_empty() {
+                Some("百度 AppID 不能为空".into())
+            } else if provider.api_secret.trim().is_empty() {
+                Some("百度密钥不能为空".into())
+            } else {
+                None
+            }
+        }
+        "openai" => {
+            if provider.base_url.trim().is_empty() || provider.api_key.trim().is_empty() {
+                Some("OpenAI-compatible 需要填写 Base URL 和 API Key".into())
+            } else {
+                None
+            }
+        }
+        "libretranslate" => {
+            if provider.base_url.trim().is_empty() {
+                Some("LibreTranslate Base URL 不能为空".into())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 async fn translate_with_libre(
@@ -557,6 +816,7 @@ async fn translate_with_libre(
     let response = reqwest::Client::new()
         .post(format!("{}/translate", base_url))
         .json(&body)
+        .timeout(Duration::from_secs(10))
         .send()
         .await
         .ok()?;
@@ -607,6 +867,7 @@ async fn translate_with_openai(
         .post(endpoint)
         .bearer_auth(api_key)
         .json(&body)
+        .timeout(Duration::from_secs(10))
         .send()
         .await
         .ok()?;
@@ -615,6 +876,245 @@ async fn translate_with_openai(
         .and_then(Value::as_str)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+async fn translate_with_azure(
+    text: &str,
+    source: &str,
+    target: &str,
+    provider: &ApiProvider,
+) -> Option<String> {
+    let api_key = provider.api_key.trim();
+    if api_key.is_empty() {
+        return None;
+    }
+    let base_url = provider_base_url(provider, "https://api.cognitive.microsofttranslator.com");
+    let endpoint = if source == "auto" {
+        format!(
+            "{}/translate?api-version=3.0&to={}",
+            base_url,
+            azure_language(target)
+        )
+    } else {
+        format!(
+            "{}/translate?api-version=3.0&from={}&to={}",
+            base_url,
+            azure_language(source),
+            azure_language(target)
+        )
+    };
+    let mut request = reqwest::Client::new()
+        .post(endpoint)
+        .header("Ocp-Apim-Subscription-Key", api_key)
+        .header("Content-Type", "application/json")
+        .json(&json!([{ "Text": text }]));
+    if !provider.region.trim().is_empty() {
+        request = request.header("Ocp-Apim-Subscription-Region", provider.region.trim());
+    }
+    let data = request
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .json::<Value>()
+        .await
+        .ok()?;
+    data.pointer("/0/translations/0/text")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+async fn translate_with_deepl(
+    text: &str,
+    source: &str,
+    target: &str,
+    provider: &ApiProvider,
+) -> Option<String> {
+    translate_with_deepl_result(text, source, target, provider)
+        .await
+        .ok()
+}
+
+async fn translate_with_deepl_result(
+    text: &str,
+    source: &str,
+    target: &str,
+    provider: &ApiProvider,
+) -> Result<String, String> {
+    let api_key = provider.api_key.trim();
+    if api_key.is_empty() {
+        return Err("DeepL API Key 不能为空".into());
+    }
+    let base_url = provider_base_url(provider, "https://api-free.deepl.com/v2");
+    let mut body = json!({
+        "text": [text],
+        "target_lang": deepl_language(target, true),
+    });
+    if source != "auto" {
+        body["source_lang"] = json!(deepl_language(source, false));
+    }
+    let response = reqwest::Client::new()
+        .post(format!("{}/translate", base_url))
+        .header("Authorization", format!("DeepL-Auth-Key {}", api_key))
+        .json(&body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|err| format!("DeepL 请求失败：{}", err))?;
+    let status = response.status();
+    let raw = response
+        .text()
+        .await
+        .map_err(|err| format!("DeepL 响应读取失败：{}", err))?;
+    let data = serde_json::from_str::<Value>(&raw).ok();
+    if !status.is_success() {
+        let detail = data
+            .as_ref()
+            .and_then(|value| value.pointer("/message").and_then(Value::as_str))
+            .unwrap_or_else(|| raw.trim())
+            .chars()
+            .take(300)
+            .collect::<String>();
+        return Err(format!(
+            "DeepL 返回 HTTP {}：{}",
+            status.as_u16(),
+            if detail.is_empty() {
+                "请检查 API Key、免费/Pro Base URL 和账号额度"
+            } else {
+                detail.as_str()
+            }
+        ));
+    }
+    let data = data.ok_or_else(|| "DeepL 返回内容不是有效 JSON".to_string())?;
+    data.pointer("/translations/0/text")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "DeepL 返回中没有译文".to_string())
+}
+
+async fn translate_with_baidu(
+    text: &str,
+    source: &str,
+    target: &str,
+    provider: &ApiProvider,
+) -> Option<String> {
+    let app_id = provider.api_key.trim();
+    let secret = provider.api_secret.trim();
+    if app_id.is_empty() || secret.is_empty() {
+        return None;
+    }
+    let base_url = provider_base_url(provider, "https://fanyi-api.baidu.com/api/trans/vip/translate");
+    let salt = Local::now().timestamp_millis().to_string();
+    let from = if source == "auto" { "auto" } else { baidu_language(source) };
+    let to = baidu_language(target);
+    let sign_raw = format!("{}{}{}{}", app_id, text, salt, secret);
+    let sign = format!("{:x}", md5::compute(sign_raw.as_bytes()));
+    let data = reqwest::Client::new()
+        .post(base_url.clone())
+        .form(&[
+            ("q", text),
+            ("from", from),
+            ("to", to),
+            ("appid", app_id),
+            ("salt", &salt),
+            ("sign", &sign),
+        ])
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .json::<Value>()
+        .await
+        .ok()?;
+    let translated = data.get("trans_result")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|item| item.get("dst").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(translated).filter(|value| !value.trim().is_empty())
+}
+
+async fn translate_with_tencent(
+    text: &str,
+    source: &str,
+    target: &str,
+    provider: &ApiProvider,
+) -> Option<String> {
+    let secret_id = provider.api_key.trim();
+    let secret_key = provider.api_secret.trim();
+    if secret_id.is_empty() || secret_key.is_empty() {
+        return None;
+    }
+    let base_url = provider_base_url(provider, "https://tmt.tencentcloudapi.com");
+    let host = base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("tmt.tencentcloudapi.com");
+    let region = if provider.region.trim().is_empty() {
+        "ap-guangzhou"
+    } else {
+        provider.region.trim()
+    };
+    let now = Utc::now();
+    let timestamp = now.timestamp();
+    let date = now.date_naive().to_string();
+    let payload = json!({
+        "SourceText": text,
+        "Source": if source == "auto" { "auto" } else { tencent_language(source) },
+        "Target": tencent_language(target),
+        "ProjectId": 0
+    })
+    .to_string();
+    let hashed_payload = hex::encode(Sha256::digest(payload.as_bytes()));
+    let canonical_headers = format!(
+        "content-type:application/json; charset=utf-8\nhost:{}\nx-tc-action:texttranslate\n",
+        host
+    );
+    let canonical_request = format!(
+        "POST\n/\n\n{}{}\n{}",
+        canonical_headers,
+        "content-type;host;x-tc-action",
+        hashed_payload
+    );
+    let credential_scope = format!("{}/tmt/tc3_request", date);
+    let string_to_sign = format!(
+        "TC3-HMAC-SHA256\n{}\n{}\n{}",
+        timestamp,
+        credential_scope,
+        hex::encode(Sha256::digest(canonical_request.as_bytes()))
+    );
+    let secret_date = hmac_sha256(format!("TC3{}", secret_key).as_bytes(), &date);
+    let secret_service = hmac_sha256(&secret_date, "tmt");
+    let secret_signing = hmac_sha256(&secret_service, "tc3_request");
+    let signature = hex::encode(hmac_sha256(&secret_signing, &string_to_sign));
+    let authorization = format!(
+        "TC3-HMAC-SHA256 Credential={}/{}, SignedHeaders=content-type;host;x-tc-action, Signature={}",
+        secret_id, credential_scope, signature
+    );
+    let data = reqwest::Client::new()
+        .post(base_url.clone())
+        .header("Authorization", authorization)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .header("Host", host)
+        .header("X-TC-Action", "TextTranslate")
+        .header("X-TC-Version", "2018-03-21")
+        .header("X-TC-Timestamp", timestamp.to_string())
+        .header("X-TC-Region", region)
+        .body(payload)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?
+        .json::<Value>()
+        .await
+        .ok()?;
+    data.pointer("/Response/TargetText")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 async fn translate_with_configured_provider(
@@ -641,18 +1141,41 @@ async fn translate_with_configured_provider(
                 .expect("default provider")
         });
 
-    let translated = match active.provider_type.as_str() {
-        "libretranslate" => translate_with_libre(text, source, target, &active).await,
-        "openai" => translate_with_openai(text, source, target, &active).await,
-        _ => translate_with_mymemory(text, source, target).await,
+    let translated = if provider_config_error(&active).is_some() {
+        None
+    } else {
+        match active.provider_type.as_str() {
+            "libretranslate" => translate_with_libre(text, source, target, &active).await,
+            "openai" => translate_with_openai(text, source, target, &active).await,
+            "tencent" => translate_with_tencent(text, source, target, &active).await,
+            "azure" => translate_with_azure(text, source, target, &active).await,
+            "deepl" => translate_with_deepl(text, source, target, &active).await,
+            "baidu" => translate_with_baidu(text, source, target, &active).await,
+            _ => translate_with_mymemory(text, source, target).await,
+        }
     };
 
-    if let Some(translated) = translated {
+    if let Some(translated) =
+        translated.filter(|value| translation_is_useful(text, value, source, target))
+    {
         return (translated, active.name);
+    }
+
+    if let Some(translated) = translate_with_google_free(text, source, target)
+        .await
+        .filter(|value| translation_is_useful(text, value, source, target))
+    {
+        let provider_name = if active.provider_type == "mymemory" {
+            "Google 免费接口 fallback".into()
+        } else {
+            format!("{} → Google 免费接口 fallback", active.name)
+        };
+        return (translated, provider_name);
     }
 
     let fallback = translate_with_mymemory(text, source, target)
         .await
+        .filter(|value| translation_is_useful(text, value, source, target))
         .unwrap_or_else(|| "翻译源暂时不可用，请稍后重试或检查设置里的 API 配置。".into());
     let provider_name = if active.provider_type == "mymemory" {
         "MyMemory 免费源".into()
@@ -850,19 +1373,25 @@ async fn generate_daily_items_with_openai(
 
 async fn english_dictionary(
     text: &str,
-) -> (Option<String>, Vec<Definition>, Vec<String>, Vec<String>) {
+    target_language: &str,
+) -> (Option<String>, Vec<Definition>, Vec<String>, Vec<String>, Vec<String>) {
     let url = format!(
         "https://api.dictionaryapi.dev/api/v2/entries/en/{}",
         urlencoding::encode(text.trim())
     );
-    let Ok(response) = reqwest::get(url).await else {
-        return (None, vec![], vec![], vec![]);
+    let Ok(response) = reqwest::Client::new()
+        .get(url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    else {
+        return (None, vec![], vec![], vec![], vec![]);
     };
     let Ok(data) = response.json::<Value>().await else {
-        return (None, vec![], vec![], vec![]);
+        return (None, vec![], vec![], vec![], vec![]);
     };
     let Some(entry) = data.as_array().and_then(|items| items.first()) else {
-        return (None, vec![], vec![], vec![]);
+        return (None, vec![], vec![], vec![], vec![]);
     };
 
     let phonetic = entry
@@ -883,6 +1412,7 @@ async fn english_dictionary(
 
     let mut definitions = Vec::new();
     let mut examples = Vec::new();
+    let mut example_translations = Vec::new();
     let mut phrases = Vec::new();
 
     if let Some(meanings) = entry.get("meanings").and_then(Value::as_array) {
@@ -921,10 +1451,29 @@ async fn english_dictionary(
                         phrases.extend(items.iter().cloned());
                     }
                     if !meaning_text.is_empty() {
+                        let meaning_translation = if target_language != "en" {
+                            translate_with_google_free(&meaning_text, "en", target_language).await
+                        } else {
+                            None
+                        };
+                        let example_translation = if target_language != "en" {
+                            if let Some(example_text) = &example {
+                                translate_with_google_free(example_text, "en", target_language).await
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(value) = &example_translation {
+                            example_translations.push(value.clone());
+                        }
                         definitions.push(Definition {
                             part_of_speech: part.clone(),
                             meaning: meaning_text,
+                            meaning_translation,
                             example,
+                            example_translation,
                             synonyms,
                         });
                     }
@@ -934,8 +1483,9 @@ async fn english_dictionary(
     }
 
     examples.truncate(6);
+    example_translations.truncate(6);
     phrases.truncate(8);
-    (phonetic, definitions, examples, phrases)
+    (phonetic, definitions, examples, example_translations, phrases)
 }
 
 #[tauri::command]
@@ -960,10 +1510,10 @@ async fn translate_text(
     let (translated_text, provider_name) =
         translate_with_configured_provider(&clean_text, &source_language, &target, &settings).await;
 
-    let (phonetic, definitions, examples, phrases) = if is_word && source_language == "en" {
-        english_dictionary(&clean_text).await
+    let (phonetic, definitions, examples, example_translations, phrases) = if is_word && source_language == "en" {
+        english_dictionary(&clean_text, &target).await
     } else {
-        (None, vec![], vec![], vec![])
+        (None, vec![], vec![], vec![], vec![])
     };
     let provider = if is_word && source_language == "en" {
         format!("{} + Free Dictionary API", provider_name)
@@ -979,6 +1529,7 @@ async fn translate_text(
         phonetic,
         definitions,
         examples,
+        example_translations,
         phrases,
         provider,
         is_word,
@@ -1007,7 +1558,19 @@ fn add_to_wordbook(state: State<'_, AppState>, item: Value) -> Result<WordbookEn
             translation: result.translated_text,
             level,
             definitions: result.definitions,
-            examples: result.examples,
+            examples: result
+                .examples
+                .iter()
+                .enumerate()
+                .map(|(index, example)| {
+                    result
+                        .example_translations
+                        .get(index)
+                        .filter(|translation| !translation.is_empty())
+                        .map(|translation| format!("{}\n{}", example, translation))
+                        .unwrap_or_else(|| example.clone())
+                })
+                .collect(),
             source: result.provider,
             created_at: now,
         }
@@ -2475,9 +3038,29 @@ fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 
 #[tauri::command]
 async fn test_api_provider(provider: ApiProvider) -> Result<ProviderTestResult, String> {
+    if let Some(message) = provider_config_error(&provider) {
+        return Ok(ProviderTestResult {
+            ok: false,
+            message,
+            translated_text: None,
+        });
+    }
     let translated = match provider.provider_type.as_str() {
         "libretranslate" => translate_with_libre("hello", "en", "zh", &provider).await,
         "openai" => translate_with_openai("hello", "en", "zh", &provider).await,
+        "tencent" => translate_with_tencent("hello", "en", "zh", &provider).await,
+        "azure" => translate_with_azure("hello", "en", "zh", &provider).await,
+        "deepl" => match translate_with_deepl_result("hello", "en", "zh", &provider).await {
+            Ok(translated) => Some(translated),
+            Err(message) => {
+                return Ok(ProviderTestResult {
+                    ok: false,
+                    message,
+                    translated_text: None,
+                });
+            }
+        },
+        "baidu" => translate_with_baidu("hello", "en", "zh", &provider).await,
         _ => translate_with_mymemory("hello", "en", "zh").await,
     };
     if let Some(translated) = translated.filter(|value| !value.trim().is_empty()) {
@@ -2489,7 +3072,10 @@ async fn test_api_provider(provider: ApiProvider) -> Result<ProviderTestResult, 
     }
     Ok(ProviderTestResult {
         ok: false,
-        message: "连接测试失败，请检查 Base URL、API Key 或模型名称".into(),
+        message: format!(
+            "{} 连接测试失败：接口未返回有效译文。请检查 Base URL、密钥、区域、服务是否开通以及免费额度是否可用。",
+            provider.name
+        ),
         translated_text: None,
     })
 }
@@ -2547,10 +3133,10 @@ async fn translate_ocr_text(
     let is_word = looks_like_word(&clean_text);
     let (translated_text, provider_name) =
         translate_with_configured_provider(&clean_text, &source_language, &target, &settings).await;
-    let (phonetic, definitions, examples, phrases) = if is_word && source_language == "en" {
-        english_dictionary(&clean_text).await
+    let (phonetic, definitions, examples, example_translations, phrases) = if is_word && source_language == "en" {
+        english_dictionary(&clean_text, &target).await
     } else {
-        (None, vec![], vec![], vec![])
+        (None, vec![], vec![], vec![], vec![])
     };
 
     Ok(TranslationResult {
@@ -2561,6 +3147,7 @@ async fn translate_ocr_text(
         phonetic,
         definitions,
         examples,
+        example_translations,
         phrases,
         provider: format!("{} + {}", provider_name, source_label),
         is_word,
@@ -2576,6 +3163,9 @@ async fn capture_screenshot(app: AppHandle) -> Result<ScreenshotCapture, String>
     }
     let capture = capture_primary_monitor_png();
     if let Some(window) = &window {
+        let _ = window.set_decorations(false);
+        let _ = window.set_always_on_top(true);
+        let _ = window.set_fullscreen(true);
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -2588,6 +3178,17 @@ async fn capture_screenshot(app: AppHandle) -> Result<ScreenshotCapture, String>
         width,
         height,
     })
+}
+
+#[tauri::command]
+fn exit_screenshot_mode(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_fullscreen(false);
+        let _ = window.set_always_on_top(false);
+        let _ = window.set_decorations(true);
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 #[tauri::command]
@@ -2655,22 +3256,29 @@ fn crop_screenshot_region(image_data_url: &str, region: &ScreenshotRegion) -> Re
         .map_err(|err| format!("读取截图数据失败：{}", err))?;
     let image = image::load_from_memory(&bytes).map_err(|err| format!("解析截图失败：{}", err))?;
     let (image_width, image_height) = image.dimensions();
-    let x = region.x.max(0.0).min(image_width.saturating_sub(1) as f64).round() as u32;
-    let y = region.y.max(0.0).min(image_height.saturating_sub(1) as f64).round() as u32;
-    let right = (region.x + region.width)
+    let margin = 14.0;
+    let x = (region.x - margin)
+        .max(0.0)
+        .min(image_width.saturating_sub(1) as f64)
+        .floor() as u32;
+    let y = (region.y - margin)
+        .max(0.0)
+        .min(image_height.saturating_sub(1) as f64)
+        .floor() as u32;
+    let right = (region.x + region.width + margin)
         .max((x + 1) as f64)
         .min(image_width as f64)
-        .round() as u32;
-    let bottom = (region.y + region.height)
+        .ceil() as u32;
+    let bottom = (region.y + region.height + margin)
         .max((y + 1) as f64)
         .min(image_height as f64)
-        .round() as u32;
+        .ceil() as u32;
     let width = right.saturating_sub(x);
     let height = bottom.saturating_sub(y);
     if width < 4 || height < 4 {
         return Err("选区太小，请重新框选".into());
     }
-    let cropped = image.crop_imm(x, y, width, height);
+    let cropped = preprocess_ocr_image(image.crop_imm(x, y, width, height));
     let mut png = Vec::new();
     cropped
         .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
@@ -2678,7 +3286,24 @@ fn crop_screenshot_region(image_data_url: &str, region: &ScreenshotRegion) -> Re
     Ok(png)
 }
 
+fn preprocess_ocr_image(image: image::DynamicImage) -> image::DynamicImage {
+    let (width, height) = image.dimensions();
+    let min_width = 720.0;
+    let min_height = 180.0;
+    let scale = (min_width / width.max(1) as f64)
+        .max(min_height / height.max(1) as f64)
+        .clamp(1.0, 3.5);
+    if scale <= 1.05 {
+        return image;
+    }
+    let target_width = ((width as f64) * scale).round().max(width as f64) as u32;
+    let target_height = ((height as f64) * scale).round().max(height as f64) as u32;
+    image.resize(target_width, target_height, FilterType::CatmullRom)
+}
+
 async fn recognize_png_bytes_with_windows_ocr(png: &[u8]) -> Result<String, String> {
+    use windows::core::HSTRING;
+    use windows::Globalization::Language;
     use windows::Graphics::Imaging::{BitmapAlphaMode, BitmapDecoder, BitmapPixelFormat, SoftwareBitmap};
     use windows::Media::Ocr::OcrEngine;
     use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
@@ -2715,17 +3340,39 @@ async fn recognize_png_bytes_with_windows_ocr(png: &[u8]) -> Result<String, Stri
         BitmapAlphaMode::Premultiplied,
     )
     .map_err(|err| format!("转换截图像素格式失败：{}", err))?;
-    let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .map_err(|err| format!("创建 Windows OCR 引擎失败：{}", err))?;
-    let result = engine
-        .RecognizeAsync(&bitmap)
-        .map_err(|err| format!("OCR 调用失败：{}", err))?
-        .get()
-        .map_err(|err| format!("OCR 识别失败：{}", err))?;
-    result
-        .Text()
-        .map(|value| value.to_string())
-        .map_err(|err| format!("读取 OCR 文本失败：{}", err))
+    let mut engines = Vec::new();
+    for tag in ["zh-Hans", "zh-Hant", "en-US"] {
+        if let Ok(language) = Language::CreateLanguage(&HSTRING::from(tag)) {
+            if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&language) {
+                engines.push(engine);
+            }
+        }
+    }
+    if let Ok(engine) = OcrEngine::TryCreateFromUserProfileLanguages() {
+        engines.push(engine);
+    }
+    if engines.is_empty() {
+        return Err("创建 Windows OCR 引擎失败，请确认系统已安装 OCR 语言包".into());
+    }
+
+    let mut best_text = String::new();
+    for engine in engines {
+        let Ok(result) = engine.RecognizeAsync(&bitmap).and_then(|operation| operation.get()) else {
+            continue;
+        };
+        let Ok(text) = result.Text().map(|value| value.to_string()) else {
+            continue;
+        };
+        if text.chars().filter(|ch| !ch.is_whitespace()).count()
+            > best_text.chars().filter(|ch| !ch.is_whitespace()).count()
+        {
+            best_text = text;
+        }
+    }
+    if best_text.trim().is_empty() {
+        return Err("OCR 未识别到文字，请扩大选区或确认系统已安装对应语言的 OCR 包".into());
+    }
+    Ok(best_text)
 }
 
 pub fn run() {
@@ -2793,6 +3440,7 @@ pub fn run() {
             save_settings,
             capture_and_translate,
             capture_screenshot,
+            exit_screenshot_mode,
             translate_screenshot_region
         ])
         .on_window_event(|window, event| {

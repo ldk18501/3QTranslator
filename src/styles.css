@@ -300,12 +300,26 @@ button:disabled {
   grid-column: 2;
 }
 
+.definition-row small,
+.example-list em {
+  color: #66738a;
+  display: block;
+  font-size: 14px;
+  font-style: normal;
+  line-height: 1.45;
+  margin-top: 4px;
+}
+
 .example-list {
   color: #33415c;
   display: grid;
   gap: 8px;
   margin: 0;
   padding-left: 20px;
+}
+
+.example-list li {
+  white-space: pre-wrap;
 }
 
 .daily-examples li {
@@ -674,37 +688,48 @@ button:disabled {
 }
 
 .modal-backdrop {
-  align-items: center;
-  background: rgba(12, 20, 34, 0.62);
-  display: flex;
+  background: #000000;
   inset: 0;
-  justify-content: center;
-  padding: 24px;
   position: fixed;
   z-index: 20;
 }
 
 .screenshot-modal {
-  background: #ffffff;
-  border-radius: 8px;
-  display: grid;
-  gap: 14px;
-  max-height: calc(100vh - 48px);
-  max-width: min(1180px, calc(100vw - 48px));
-  padding: 16px;
-  width: 100%;
+  background: #000000;
+  height: 100vh;
+  overflow: hidden;
+  position: relative;
+  width: 100vw;
 }
 
 .modal-header,
 .modal-footer {
   align-items: center;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid rgba(203, 215, 231, 0.9);
+  border-radius: 8px;
   display: flex;
   gap: 14px;
   justify-content: space-between;
+  left: 50%;
+  max-width: min(860px, calc(100vw - 32px));
+  padding: 10px 12px;
+  position: absolute;
+  transform: translateX(-50%);
+  width: max-content;
+  z-index: 2;
+}
+
+.modal-header {
+  top: 14px;
+}
+
+.modal-footer {
+  bottom: 14px;
 }
 
 .modal-header h2 {
-  font-size: 18px;
+  font-size: 16px;
   margin: 0;
 }
 
@@ -715,20 +740,18 @@ button:disabled {
 }
 
 .screenshot-stage {
-  background: #121a2a;
-  border: 1px solid #25334a;
-  border-radius: 8px;
   cursor: crosshair;
-  max-height: calc(100vh - 220px);
+  height: 100vh;
   overflow: hidden;
   position: relative;
   user-select: none;
+  width: 100vw;
 }
 
 .screenshot-stage img {
   display: block;
-  max-height: calc(100vh - 220px);
-  object-fit: contain;
+  height: 100vh;
+  object-fit: fill;
   width: 100%;
 }
 
@@ -791,6 +814,7 @@ button:disabled {
   .modal-footer {
     align-items: stretch;
     flex-direction: column;
+    width: calc(100vw - 28px);
   }
 }
 

@@ -21,6 +21,7 @@ import {
   addToWordbook,
   captureScreenshot,
   deleteWordbookEntry,
+  exitScreenshotMode,
   getSettings,
   listWordbook,
   saveSettings,
@@ -147,14 +148,19 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
   const [result, setResult] = useState<TranslationResult | null>(null);
   const [notice, setNotice] = useState("");
   const [screenshot, setScreenshot] = useState<ScreenshotCapture | null>(null);
+  const translateRequestIdRef = useRef(0);
 
   const translateMutation = useMutation({
-    mutationFn: () => translateText(text.trim(), targetLanguage || undefined),
-    onSuccess: (value) => {
+    mutationFn: ({ requestId }: { requestId: number }) => translateText(text.trim(), targetLanguage || undefined).then((value) => ({ value, requestId })),
+    onSuccess: ({ value, requestId }) => {
+      if (requestId !== translateRequestIdRef.current) return;
       setNotice("");
       setResult(value);
     },
-    onError: (error) => setNotice(errorMessage(error)),
+    onError: (error, variables) => {
+      if (variables.requestId !== translateRequestIdRef.current) return;
+      setNotice(errorMessage(error));
+    },
   });
 
   const addMutation = useMutation({
@@ -175,7 +181,10 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
   });
 
   const regionMutation = useMutation({
-    mutationFn: ({ imageDataUrl, region }: { imageDataUrl: string; region: ScreenshotRegion }) => translateScreenshotRegion(imageDataUrl, region),
+    mutationFn: async ({ imageDataUrl, region }: { imageDataUrl: string; region: ScreenshotRegion }) => {
+      await exitScreenshotMode();
+      return translateScreenshotRegion(imageDataUrl, region);
+    },
     onSuccess: (value) => {
       setResult(value);
       setText(value.sourceText);
@@ -193,6 +202,16 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
   const detectedTarget = result
     ? result.targetLanguage
     : defaultTargetFor("en", settings?.defaultEnglishTarget, settings?.defaultOtherTarget);
+  const startTranslate = () => {
+    const requestId = translateRequestIdRef.current + 1;
+    translateRequestIdRef.current = requestId;
+    translateMutation.mutate({ requestId });
+  };
+  const cancelTranslate = () => {
+    translateRequestIdRef.current += 1;
+    translateMutation.reset();
+    setNotice("已取消本次翻译");
+  };
 
   return (
     <div className="page">
@@ -220,10 +239,17 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
           <textarea value={text} onChange={(event) => setText(event.target.value)} placeholder="输入单词、句子或长文本" />
           <div className="panel-footer">
             <span>{text.length} 字符</span>
-            <button className="primary-button" disabled={!text.trim() || translateMutation.isPending} onClick={() => translateMutation.mutate()}>
-              <Search size={16} />
-              {translateMutation.isPending ? "翻译中" : "翻译"}
-            </button>
+            {translateMutation.isPending ? (
+              <button className="secondary-button" onClick={cancelTranslate}>
+                <X size={16} />
+                取消
+              </button>
+            ) : (
+              <button className="primary-button" disabled={!text.trim()} onClick={startTranslate}>
+                <Search size={16} />
+                翻译
+              </button>
+            )}
           </div>
         </div>
 
@@ -245,9 +271,16 @@ function TranslateView({ settings, screenshotRequest }: { settings?: AppSettings
         <ScreenshotSelector
           screenshot={screenshot}
           pending={regionMutation.isPending}
-          onClose={() => setScreenshot(null)}
+          onClose={() => {
+            setScreenshot(null);
+            void exitScreenshotMode();
+          }}
           onRetry={() => captureMutation.mutate()}
-          onSubmit={(region) => regionMutation.mutate({ imageDataUrl: screenshot.imageDataUrl, region })}
+          onSubmit={(region) => {
+            const imageDataUrl = screenshot.imageDataUrl;
+            setScreenshot(null);
+            regionMutation.mutate({ imageDataUrl, region });
+          }}
         />
       )}
     </div>
@@ -275,6 +308,14 @@ function ScreenshotSelector({
     setSelection(null);
     setDragStart(null);
   }, [screenshot.imageDataUrl]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
 
   const pointFromEvent = (event: ReactMouseEvent): { x: number; y: number } => {
     const rect = imageRef.current?.getBoundingClientRect();
@@ -324,7 +365,7 @@ function ScreenshotSelector({
         <header className="modal-header">
           <div>
             <h2>框选截图翻译区域</h2>
-            <p>拖动鼠标选择需要识别的文字区域，选错后可以直接重新框选。</p>
+            <p>拖动鼠标选择需要识别的文字区域，选错后直接重新框选。</p>
           </div>
           <button className="icon-button" onClick={onClose} title="关闭">
             <X size={18} />
@@ -394,8 +435,16 @@ function TranslationCard({
           {result.definitions.map((item, index) => (
             <div className="definition-row" key={`${item.partOfSpeech}-${index}`}>
               <span>{item.partOfSpeech}</span>
-              <p>{item.meaning}</p>
-              {item.example && <em>{item.example}</em>}
+              <p>
+                {item.meaning}
+                {item.meaningTranslation && <small>{item.meaningTranslation}</small>}
+              </p>
+              {item.example && (
+                <em>
+                  {item.example}
+                  {item.exampleTranslation && <small>{item.exampleTranslation}</small>}
+                </em>
+              )}
             </div>
           ))}
         </section>
@@ -405,8 +454,11 @@ function TranslationCard({
         <section className="result-section">
           <h3>例句</h3>
           <ul className="example-list">
-            {result.examples.slice(0, 4).map((item) => (
-              <li key={item}>{item}</li>
+            {result.examples.slice(0, 4).map((item, index) => (
+              <li key={item}>
+                <span>{item}</span>
+                {result.exampleTranslations[index] && <em>{result.exampleTranslations[index]}</em>}
+              </li>
             ))}
           </ul>
         </section>
@@ -603,8 +655,16 @@ function WordbookCard({
           {item.definitions.map((definition, index) => (
             <div className="definition-row compact-definition" key={`${definition.partOfSpeech}-${index}`}>
               <span>{definition.partOfSpeech}</span>
-              <p>{definition.meaning}</p>
-              {definition.example && <em>{definition.example}</em>}
+              <p>
+                {definition.meaning}
+                {definition.meaningTranslation && <small>{definition.meaningTranslation}</small>}
+              </p>
+              {definition.example && (
+                <em>
+                  {definition.example}
+                  {definition.exampleTranslation && <small>{definition.exampleTranslation}</small>}
+                </em>
+              )}
             </div>
           ))}
           {item.examples.length > 0 && (
@@ -651,6 +711,7 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState<AppSettings | null>(settings ?? null);
   const [notice, setNotice] = useState("");
+  const [noticeError, setNoticeError] = useState(false);
   const [testingProviderId, setTestingProviderId] = useState("");
 
   useEffect(() => {
@@ -661,17 +722,25 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
     mutationFn: (value: AppSettings) => saveSettings(value),
     onSuccess: () => {
       setNotice("设置已保存");
+      setNoticeError(false);
       queryClient.invalidateQueries({ queryKey: ["settings"] });
     },
-    onError: (error) => setNotice(errorMessage(error)),
+    onError: (error) => {
+      setNotice(errorMessage(error));
+      setNoticeError(true);
+    },
   });
   const providerTestMutation = useMutation({
     mutationFn: (provider: ApiProvider) => testApiProvider(provider),
     onMutate: (provider) => setTestingProviderId(provider.id),
     onSuccess: (result) => {
-      setNotice(result.ok ? `连接可用：${result.translatedText ?? result.message}` : result.message);
+      setNotice(result.ok ? `连接可用：${result.translatedText ?? result.message}` : `连接失败：${result.message}`);
+      setNoticeError(!result.ok);
     },
-    onError: (error) => setNotice(errorMessage(error)),
+    onError: (error) => {
+      setNotice(errorMessage(error));
+      setNoticeError(true);
+    },
     onSettled: () => setTestingProviderId(""),
   });
 
@@ -695,6 +764,8 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
           enabled: true,
           baseUrl: "",
           apiKey: "",
+          apiSecret: "",
+          region: "",
           model: "gpt-4o-mini",
         },
       ],
@@ -721,7 +792,7 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
           {saveMutation.isPending ? "保存中" : "保存"}
         </button>
       </header>
-      {notice && <div className={clsx("inline-status", saveMutation.isError && "error-text")}>{notice}</div>}
+      {notice && <div className={clsx("inline-status", noticeError && "error-text")}>{notice}</div>}
 
       <section className="settings-grid">
         <label>
@@ -828,6 +899,10 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
                     <option value="mymemory">MyMemory 免费源</option>
                     <option value="libretranslate">LibreTranslate</option>
                     <option value="openai">OpenAI-compatible</option>
+                    <option value="tencent">腾讯云机器翻译</option>
+                    <option value="azure">Azure Translator</option>
+                    <option value="deepl">DeepL API</option>
+                    <option value="baidu">百度翻译开放平台</option>
                   </select>
                 </label>
                 {provider.providerType !== "mymemory" && (
@@ -836,11 +911,49 @@ function SettingsView({ settings }: { settings?: AppSettings }) {
                     <input
                       value={provider.baseUrl}
                       onChange={(event) => updateProvider(provider.id, "baseUrl", event.target.value)}
-                      placeholder={provider.providerType === "libretranslate" ? "https://libretranslate.example.com" : "https://api.example.com/v1"}
+                      placeholder={
+                        provider.providerType === "libretranslate"
+                          ? "https://libretranslate.example.com"
+                          : provider.providerType === "deepl"
+                            ? "https://api-free.deepl.com/v2"
+                            : provider.providerType === "azure"
+                              ? "https://api.cognitive.microsofttranslator.com"
+                              : provider.providerType === "baidu"
+                                ? "https://fanyi-api.baidu.com/api/trans/vip/translate"
+                                : provider.providerType === "tencent"
+                                  ? "https://tmt.tencentcloudapi.com"
+                                  : "https://api.example.com/v1"
+                      }
                     />
                   </label>
                 )}
-                {provider.providerType !== "mymemory" && (
+                {provider.providerType !== "mymemory" && provider.providerType !== "libretranslate" && (
+                  <label>
+                    {provider.providerType === "tencent"
+                      ? "SecretId"
+                      : provider.providerType === "baidu"
+                        ? "AppID"
+                        : "API Key"}
+                    <input type="password" value={provider.apiKey} onChange={(event) => updateProvider(provider.id, "apiKey", event.target.value)} />
+                  </label>
+                )}
+                {["tencent", "baidu"].includes(provider.providerType) && (
+                  <label>
+                    {provider.providerType === "tencent" ? "SecretKey" : "密钥"}
+                    <input type="password" value={provider.apiSecret} onChange={(event) => updateProvider(provider.id, "apiSecret", event.target.value)} />
+                  </label>
+                )}
+                {["tencent", "azure"].includes(provider.providerType) && (
+                  <label>
+                    区域
+                    <input
+                      value={provider.region}
+                      onChange={(event) => updateProvider(provider.id, "region", event.target.value)}
+                      placeholder={provider.providerType === "tencent" ? "ap-guangzhou" : "eastasia"}
+                    />
+                  </label>
+                )}
+                {provider.providerType === "libretranslate" && (
                   <label>
                     API Key
                     <input type="password" value={provider.apiKey} onChange={(event) => updateProvider(provider.id, "apiKey", event.target.value)} />
